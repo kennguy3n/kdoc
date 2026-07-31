@@ -1,0 +1,296 @@
+@import '@fontsource/geist';
+@import '@fontsource/geist-mono';
+@import 'tailwindcss';
+@import 'tw-animate-css';
+
+@theme {
+  --font-sans: 'Geist', ui-sans-serif, system-ui, sans-serif;
+  --font-mono: 'Geist Mono', ui-monospace, monospace;
+}
+
+:root {
+  --bg: oklch(0.99 0.002 240);
+  --surface: oklch(0.98 0.003 240);
+  --surface-2: oklch(0.95 0.004 240);
+  --surface-3: oklch(0.92 0.005 240);
+  --border: oklch(0.90 0.005 240);
+  --fg: oklch(0.20 0.01 240);
+  --muted: oklch(0.55 0.01 240);
+  --brand: oklch(0.55 0.22 260);
+  --brand-fg: oklch(0.99 0 0);
+  --danger: oklch(0.55 0.22 25);
+  --danger-fg: oklch(0.99 0 0);
+  --success: oklch(0.55 0.17 150);
+  --warning: oklch(0.70 0.17 70);
+  --ring: oklch(0.55 0.22 260);
+}
+
+.dark {
+  --bg: oklch(0.16 0.01 260);
+  --surface: oklch(0.19 0.01 260);
+  --surface-2: oklch(0.22 0.01 260);
+  --surface-3: oklch(0.26 0.01 260);
+  --border: oklch(0.28 0.01 260);
+  --fg: oklch(0.92 0.01 260);
+  --muted: oklch(0.60 0.01 260);
+  --brand: oklch(0.65 0.22 260);
+  --brand-fg: oklch(0.10 0 0);
+  --danger: oklch(0.60 0.22 25);
+  --danger-fg: oklch(0.99 0 0);
+  --success: oklch(0.60 0.17 150);
+  --warning: oklch(0.75 0.17 70);
+  --ring: oklch(0.65 0.22 260);
+}
+
+@theme inline {
+  --color-bg: var(--bg);
+  --color-surface: var(--surface);
+  --color-surface-2: var(--surface-2);
+  --color-surface-3: var(--surface-3);
+  --color-border: var(--border);
+  --color-fg: var(--fg);
+  --color-muted: var(--muted);
+  --color-brand: var(--brand);
+  --color-brand-fg: var(--brand-fg);
+  --color-danger: var(--danger);
+  --color-danger-fg: var(--danger-fg);
+  --color-success: var(--success);
+  --color-warning: var(--warning);
+  --color-ring: var(--ring);
+}
+
+* {
+  border-color: var(--border);
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+  background-color: var(--bg);
+  color: var(--fg);
+  font-family: var(--font-sans);
+  font-size: 14px;
+  line-height: 1.6;
+  -webkit-font-smoothing: antialiased;
+}
+
+#root {
+  height: 100%;
+}
+
+/* Scrollbar styling */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--surface-3);
+  border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--muted);
+}
+
+/* TipTap Editor Styles */
+.tiptap {
+  outline: none;
+  min-height: 300px;
+}
+
+.tiptap p {
+  margin: 0.5em 0;
+}
+
+.tiptap h1 {
+  font-size: 1.875em;
+  font-weight: 700;
+  margin: 0.8em 0 0.4em;
+  line-height: 1.3;
+}
+
+.tiptap h2 {
+  font-size: 1.5em;
+  font-weight: 700;
+  margin: 0.7em 0 0.35em;
+  line-height: 1.3;
+}
+
+.tiptap h3 {
+  font-size: 1.25em;
+  font-weight: 600;
+  margin: 0.6em 0 0.3em;
+  line-height: 1.4;
+}
+
+.tiptap ul,
+.tiptap ol {
+  padding-left: 1.5em;
+  margin: 0.5em 0;
+}
+
+.tiptap ul {
+  list-style: disc;
+}
+
+.tiptap ol {
+  list-style: decimal;
+}
+
+.tiptap li {
+  margin: 0.25em 0;
+}
+
+.tiptap blockquote {
+  border-left: 3px solid var(--brand);
+  padding-left: 1em;
+  margin: 0.75em 0;
+  color: var(--muted);
+  font-style: italic;
+}
+
+.tiptap pre {
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 1em;
+  overflow-x: auto;
+  font-family: var(--font-mono);
+  font-size: 0.875em;
+  margin: 0.75em 0;
+}
+
+.tiptap code {
+  background: var(--surface-2);
+  border-radius: 4px;
+  padding: 0.15em 0.35em;
+  font-family: var(--font-mono);
+  font-size: 0.875em;
+}
+
+.tiptap pre code {
+  background: transparent;
+  padding: 0;
+  border-radius: 0;
+}
+
+.tiptap a {
+  color: var(--brand);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.tiptap hr {
+  border: none;
+  border-top: 1px solid var(--border);
+  margin: 1.5em 0;
+}
+
+.tiptap img {
+  max-width: 100%;
+  border-radius: 8px;
+  margin: 0.75em 0;
+}
+
+.tiptap table {
+  border-collapse: collapse;
+  width: 100%;
+  margin: 0.75em 0;
+}
+
+.tiptap th,
+.tiptap td {
+  border: 1px solid var(--border);
+  padding: 0.5em 0.75em;
+  text-align: left;
+}
+
+.tiptap th {
+  background: var(--surface-2);
+  font-weight: 600;
+}
+
+.tiptap ul[data-type='taskList'] {
+  list-style: none;
+  padding-left: 0;
+}
+
+.tiptap ul[data-type='taskList'] li {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.5em;
+}
+
+.tiptap ul[data-type='taskList'] li > label {
+  flex-shrink: 0;
+  margin-top: 0.25em;
+}
+
+.tiptap ul[data-type='taskList'] li > div {
+  flex: 1;
+}
+
+/* Placeholder */
+.tiptap p.is-editor-empty:first-child::before {
+  content: attr(data-placeholder);
+  float: left;
+  color: var(--muted);
+  pointer-events: none;
+  height: 0;
+}
+
+/* Ghost text (inline AI suggestions) */
+.ghost-text {
+  background-color: color-mix(in oklch, var(--brand) 12%, transparent);
+  border-radius: 3px;
+  padding: 0 1px;
+  transition: background-color 0.2s;
+}
+
+.ghost-text::after {
+  content: '';
+  display: inline-block;
+  width: 2px;
+  height: 1em;
+  margin-left: 1px;
+  background: var(--brand);
+  vertical-align: text-bottom;
+  animation: ghost-cursor-blink 1s step-end infinite;
+}
+
+@keyframes ghost-cursor-blink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0; }
+}
+
+/* Block drag handle */
+.block-drag-handle {
+  cursor: grab;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 24px;
+  color: var(--muted);
+  opacity: 0;
+  transition: opacity 0.15s;
+}
+
+.block-drag-handle:hover {
+  opacity: 1;
+  color: var(--fg);
+}
+
+.block-drag-handle:active {
+  cursor: grabbing;
+}
+
+/* ProseMirror selection */
+.ProseMirror-selectednode {
+  outline: 2px solid var(--brand);
+  border-radius: 4px;
+}

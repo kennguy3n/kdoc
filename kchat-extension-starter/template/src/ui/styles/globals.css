@@ -1,0 +1,293 @@
+/**
+ * Global styles for the KChat sample extension.
+ *
+ * - Tailwind v4 + tw-animate-css
+ * - Geist font family
+ * - OKLCH-based design tokens (purple primary, gray scale) — mirrors host
+ *   uney-chat-desktop conventions so the extension feels native inside the
+ *   outer-rightbar / main-content overlay surfaces.
+ */
+
+@import 'tailwindcss';
+@import 'tw-animate-css';
+
+@import '@fontsource/geist/400.css';
+@import '@fontsource/geist/500.css';
+@import '@fontsource/geist/600.css';
+@import '@fontsource/geist-mono/400.css';
+@import '@fontsource/geist-mono/500.css';
+
+@source "../../../src/**/*.{ts,tsx}";
+
+/*
+ * Dark-mode selector contract.
+ *
+ * The host SDK's `applyDefaultTheme(themeMode)` (see
+ * `packages/kchat-sdk/src/client/host-shell.ts`) writes
+ * `documentElement.dataset.kchatTheme = themeMode` — it does NOT
+ * add a `.dark` class. We therefore key both the token override
+ * block and Tailwind's `dark:` variant off the documented data
+ * attribute so the cascade flips automatically when the host fires
+ * `kchat:themechange`.
+ *
+ * `:where(...)` keeps specificity at zero so per-component
+ * overrides remain reachable without `!important`.
+ */
+@custom-variant dark (&:where([data-kchat-theme='dark'], [data-kchat-theme='dark'] *));
+
+/* ============================================================================
+   Design tokens — Light
+   ============================================================================ */
+
+:root {
+  /* Surfaces */
+  --background: oklch(99.1% 0.0015 277.7);
+  --foreground: oklch(24.1% 0.0099 277.7);
+  --card: oklch(99.1% 0.0015 277.7);
+  --card-foreground: oklch(24.1% 0.0099 277.7);
+  --popover: oklch(99.1% 0.0015 277.7);
+  --popover-foreground: oklch(24.1% 0.0099 277.7);
+
+  /* Primary — purple accent */
+  --primary: oklch(56.5% 0.196 285.3);
+  --primary-foreground: oklch(98.5% 0.024 285.3);
+  --primary-soft: oklch(95.6% 0.0245 285.3);
+
+  /* Secondary / muted / accent */
+  --secondary: oklch(95.6% 0.0045 277.7);
+  --secondary-foreground: oklch(24.1% 0.0099 277.7);
+  --muted: oklch(95.6% 0.0045 277.7);
+  --muted-foreground: oklch(50.3% 0.0139 277.7);
+  --accent: oklch(95.6% 0.0045 277.7);
+  --accent-foreground: oklch(24.1% 0.0099 277.7);
+
+  /* Status */
+  --destructive: oklch(57.85% 0.2191 24.2);
+  --destructive-foreground: oklch(99.2% 0.0027 37.78);
+  --success: oklch(62% 0.13 152);
+  --success-foreground: oklch(98% 0.01 152);
+  --warning: oklch(75% 0.14 75);
+  --warning-foreground: oklch(20% 0.04 75);
+  --info: oklch(62% 0.13 245);
+  --info-foreground: oklch(98% 0.01 245);
+
+  /* Border / input / ring */
+  --border: oklch(93.1% 0.0061 277.7);
+  --input: oklch(93.1% 0.0061 277.7);
+  --ring: oklch(56.5% 0.196 285.3);
+
+  /* Geometry */
+  --radius: 0.625rem;
+
+  /* Animation tokens */
+  --duration-micro: 80ms;
+  --duration-fast: 150ms;
+  --duration-standard: 220ms;
+  --duration-relaxed: 320ms;
+
+  --ease-standard: cubic-bezier(0.4, 0, 0.2, 1);
+  --ease-decelerate: cubic-bezier(0, 0, 0.2, 1);
+  --ease-accelerate: cubic-bezier(0.4, 0, 1, 1);
+}
+
+/* ============================================================================
+   Design tokens — Dark
+   ============================================================================ */
+
+[data-kchat-theme='dark'] {
+  --background: oklch(17.8% 0.0042 277.7);
+  --foreground: oklch(94.9% 0.0026 277.7);
+  --card: oklch(17.8% 0.0042 277.7);
+  --card-foreground: oklch(94.9% 0.0026 277.7);
+  --popover: oklch(17.8% 0.0042 277.7);
+  --popover-foreground: oklch(94.9% 0.0026 277.7);
+
+  --primary: oklch(70% 0.18 285.3);
+  --primary-foreground: oklch(18% 0.029 285.3);
+  --primary-soft: oklch(28% 0.06 285.3);
+
+  --secondary: oklch(25.5% 0.0055 277.7);
+  --secondary-foreground: oklch(94.9% 0.0026 277.7);
+  --muted: oklch(25.5% 0.0055 277.7);
+  --muted-foreground: oklch(72% 0.0138 277.7);
+  --accent: oklch(25.5% 0.0055 277.7);
+  --accent-foreground: oklch(94.9% 0.0026 277.7);
+
+  --destructive: oklch(63% 0.22 24.2);
+  --destructive-foreground: oklch(96% 0.02 24.2);
+  --success: oklch(70% 0.15 152);
+  --success-foreground: oklch(15% 0.03 152);
+  --warning: oklch(80% 0.15 75);
+  --warning-foreground: oklch(15% 0.04 75);
+  --info: oklch(72% 0.13 245);
+  --info-foreground: oklch(15% 0.03 245);
+
+  --border: oklch(25.5% 0.0055 277.7);
+  --input: oklch(25.5% 0.0055 277.7);
+  --ring: oklch(70% 0.18 285.3);
+}
+
+/* ============================================================================
+   Map tokens to Tailwind v4 theme
+   ============================================================================ */
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-primary-soft: var(--primary-soft);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-success: var(--success);
+  --color-success-foreground: var(--success-foreground);
+  --color-warning: var(--warning);
+  --color-warning-foreground: var(--warning-foreground);
+  --color-info: var(--info);
+  --color-info-foreground: var(--info-foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+
+  --font-sans:
+    'Geist', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  --font-mono:
+    'Geist Mono', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas,
+    monospace;
+}
+
+/* ============================================================================
+   Base reset
+   ============================================================================ */
+
+@layer base {
+  *,
+  *::before,
+  *::after {
+    box-sizing: border-box;
+    margin: 0;
+    padding: 0;
+  }
+
+  * {
+    @apply border-border;
+  }
+
+  html,
+  body,
+  #root {
+    height: 100%;
+    width: 100%;
+  }
+
+  html {
+    font-size: 16px;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    text-rendering: optimizeLegibility;
+  }
+
+  body {
+    @apply bg-background text-foreground font-sans;
+    line-height: 1.5;
+    overflow: hidden;
+    font-feature-settings:
+      'liga' 1,
+      'calt' 1;
+  }
+
+  code,
+  kbd,
+  samp,
+  pre,
+  .font-mono {
+    font-family: var(--font-mono);
+  }
+
+  img,
+  picture,
+  video,
+  canvas,
+  svg {
+    display: block;
+    max-width: 100%;
+  }
+
+  button,
+  [role='button'] {
+    cursor: pointer;
+  }
+
+  button:disabled,
+  [role='button'][aria-disabled='true'] {
+    cursor: not-allowed;
+  }
+
+  :focus-visible {
+    outline: 2px solid var(--ring);
+    outline-offset: 2px;
+  }
+
+  textarea,
+  input {
+    font-family: inherit;
+    color: inherit;
+  }
+
+  ::selection {
+    background-color: color-mix(in oklch, var(--primary) 25%, transparent);
+  }
+}
+
+/* ============================================================================
+   Utility: thin scrollbar (mac-style)
+   ============================================================================ */
+
+@utility scrollbar-thin {
+  scrollbar-width: thin;
+  scrollbar-color: color-mix(in oklch, var(--foreground) 18%, transparent)
+    transparent;
+
+  &::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+  }
+
+  &::-webkit-scrollbar-track {
+    background: transparent;
+  }
+
+  &::-webkit-scrollbar-thumb {
+    background-color: color-mix(in oklch, var(--foreground) 18%, transparent);
+    border-radius: 9999px;
+    transition: background-color var(--duration-fast) var(--ease-standard);
+  }
+
+  &::-webkit-scrollbar-thumb:hover {
+    background-color: color-mix(in oklch, var(--foreground) 32%, transparent);
+  }
+}
+
+@utility scrollbar-hidden {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+
+  &::-webkit-scrollbar {
+    display: none;
+  }
+}

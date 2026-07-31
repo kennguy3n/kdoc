@@ -1,0 +1,65 @@
+{
+  "manifestVersion": 1,
+  "id": "your-vendor.your-extension",
+  "name": "My KChat Extension",
+  "version": "0.1.0",
+  "publisher": "your-vendor",
+  "sdkVersion": "^1.0.0",
+  "entry": {
+    "client": "dist/client/index.html",
+    "server": "dist/server/index.js"
+  },
+  "dev": {
+    "sourceRoot": "${MANIFEST_DIR}",
+    "devServerUrl": "http://localhost:5150"
+  },
+  "activationEvents": ["onAppReady"],
+  "contributes": {
+    "views": [
+      {
+        "id": "home-panel",
+        "title": "My Extension",
+        "slot": "com.kchat.desktop.slot.outer-rightbar",
+        "options": {
+          "showCloseButton": false
+        }
+      }
+    ],
+    "paths": [
+      {
+        "id": "home",
+        "view": "home-panel",
+        "path": "/home"
+      }
+    ],
+    "actions": [
+      {
+        "id": "open-home",
+        "title": "My Extension",
+        "icon": "bot",
+        "placement": "com.kchat.desktop.placement.global-header-right",
+        "target": {
+          "path": "home"
+        },
+        "order": 100
+      }
+    ],
+    "commands": [
+      {
+        "id": "your-extension.echo",
+        "title": "Echo"
+      }
+    ]
+  },
+  "permissions": {
+    "runtime": ["context"],
+    "kchat": ["query_messages"]
+  },
+  "resources": {
+    "public": ["dist/client/assets/**", "dist/client/favicon.svg"]
+  },
+  "update": {
+    "policy": "notify",
+    "channel": "stable"
+  }
+}

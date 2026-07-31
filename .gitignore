@@ -1,0 +1,22 @@
+# OS
+.DS_Store
+
+# Model files
+model/
+
+# Rust build artifacts
+kdoc-extension/rust-backend/target/
+
+# Node dependencies
+node_modules/
+
+# Build output
+dist/
+artifacts/
+
+# Environment
+.env
+.env.local
+
+# Editor
+*.tsbuildinfo

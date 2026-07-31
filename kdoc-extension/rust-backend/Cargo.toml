@@ -1,0 +1,38 @@
+[package]
+name = "kdoc-ai-backend"
+version = "0.1.0"
+edition = "2021"
+description = "Cross-platform AI backend for KDoc editor (GGUF)"
+
+[[bin]]
+name = "kdoc-ai"
+path = "src/main.rs"
+
+[dependencies]
+axum = { version = "0.8", features = ["json"] }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tower-http = { version = "0.6", features = ["cors"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+futures-util = "0.3"
+tokio-stream = "0.1"
+
+# GGUF support via candle on Apple platforms
+[target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
+candle-core = { version = "0.9", features = ["metal"] }
+candle-nn = { version = "0.9", features = ["metal"] }
+candle-transformers = "0.9"
+hf-hub = { version = "0.4", features = ["tokio"] }
+tokenizers = "0.21"
+
+[features]
+default = []
+gguf = []
+all = []
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true

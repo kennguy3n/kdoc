@@ -1,0 +1,78 @@
+{
+  "manifestVersion": 1,
+  "id": "kennguy3n.kdoc",
+  "name": "KDoc",
+  "version": "0.1.0",
+  "publisher": "kennguy3n",
+  "sdkVersion": "^1.0.0",
+  "entry": {
+    "client": "dist/client/index.html",
+    "server": "dist/server/index.js"
+  },
+  "dev": {
+    "sourceRoot": "${MANIFEST_DIR}",
+    "devServerUrl": "http://localhost:5151"
+  },
+  "activationEvents": ["onAppReady"],
+  "contributes": {
+    "views": [
+      {
+        "id": "kdoc-panel",
+        "title": "KDoc",
+        "slot": "com.kchat.desktop.slot.outer-rightbar",
+        "options": {
+          "showCloseButton": false
+        }
+      }
+    ],
+    "paths": [
+      {
+        "id": "home",
+        "view": "kdoc-panel",
+        "path": "/home",
+        "deeplink": true
+      },
+      {
+        "id": "editor",
+        "view": "kdoc-panel",
+        "path": "/editor",
+        "deeplink": true,
+        "query": ["doc"]
+      }
+    ],
+    "actions": [
+      {
+        "id": "open-kdoc",
+        "title": "KDoc",
+        "icon": "file-text",
+        "placement": "com.kchat.desktop.placement.global-header-right",
+        "target": {
+          "path": "home"
+        },
+        "order": 100
+      }
+    ],
+    "commands": [
+      {
+        "id": "kennguy3n.kdoc.ai-skill",
+        "title": "AI Skill"
+      },
+      {
+        "id": "kennguy3n.kdoc.export",
+        "title": "Export Document"
+      }
+    ]
+  },
+  "permissions": {
+    "runtime": ["context"],
+    "kchat": ["query_messages"],
+    "mcp": ["expose"]
+  },
+  "resources": {
+    "public": ["dist/client/assets/**", "dist/client/favicon.svg", "dist/client/wllama/**"]
+  },
+  "update": {
+    "policy": "notify",
+    "channel": "stable"
+  }
+}

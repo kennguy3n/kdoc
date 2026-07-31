@@ -1,0 +1,19 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+artifacts/
+
+# Environment
+.env
+.env.local
+
+# Editor
+*.tsbuildinfo
+
+# OS
+.DS_Store
+
+# Rust build artifacts
+rust-backend/target/
