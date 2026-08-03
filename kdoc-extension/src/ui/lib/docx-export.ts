@@ -184,9 +184,12 @@ function convertList(
   const out: Paragraph[] = []
   const parentList = ctx.list
   const level = parentList?.type === type ? parentList.level + 1 : 0
+  // Cap at the max level defined in the numbering config (3 for ordered,
+  // docx bullets have no explicit cap but 9 is a safe upper bound).
+  const cappedLevel = type === 'ordered' ? Math.min(level, 3) : Math.min(level, 8)
   node.forEach((child) => {
     if (child.type.name === 'listItem') {
-      ctx.list = { type, level }
+      ctx.list = { type, level: cappedLevel }
       child.forEach((itemChild) => {
         const converted = convertBlock(itemChild, ctx)
         if (converted) out.push(...(converted as Paragraph[]))
@@ -200,17 +203,20 @@ function convertList(
 function convertTaskList(node: ProseMirrorNode, ctx: ConversionContext): Paragraph[] {
   const out: Paragraph[] = []
   const parentList = ctx.list
+  // Task lists use bullet styling; respect nesting level from parent list
+  // if it's also a bullet list, otherwise start at level 0.
+  const level = parentList?.type === 'bullet' ? Math.min(parentList.level + 1, 8) : 0
   node.forEach((child) => {
     if (child.type.name === 'taskItem') {
       const checked = Boolean(child.attrs.checked)
       const prefix = checked ? '\u2611 ' : '\u2610 ' // ☑ / ☐
-      ctx.list = { type: 'bullet', level: 0 }
+      ctx.list = { type: 'bullet', level }
       child.forEach((itemChild) => {
         if (itemChild.type.name === 'paragraph') {
           const inline = convertInline(itemChild)
           out.push(
             new Paragraph({
-              bullet: { level: 0 },
+              bullet: { level },
               children: [new TextRun({ text: prefix }), ...inline],
             }),
           )
@@ -296,8 +302,8 @@ function convertImage(node: ProseMirrorNode): Paragraph {
       alignment: AlignmentType.CENTER,
     })
   }
-  const widthPx = typeof width === 'number' ? width : 400
-  const heightPx = typeof height === 'number' ? height : 300
+  const widthPx = parsePx(width, 400)
+  const heightPx = parsePx(height, 300)
   return new Paragraph({
     children: [
       new ImageRun({
@@ -313,13 +319,22 @@ function convertImage(node: ProseMirrorNode): Paragraph {
 
 function convertTable(node: ProseMirrorNode): Table {
   const rows: TableRow[] = []
-  let rowIndex = 0
   node.forEach((rowNode) => {
     if (rowNode.type.name !== 'tableRow') return
-    const cells: TableCell[] = []
+    // First pass: collect cell nodes and compute total column span count
+    // so we can distribute widths evenly (accounting for colspan).
+    const cellNodes: ProseMirrorNode[] = []
+    let totalCols = 0
     rowNode.forEach((cellNode) => {
       if (cellNode.type.name !== 'tableCell' && cellNode.type.name !== 'tableHeader') return
+      cellNodes.push(cellNode)
+      totalCols += (cellNode.attrs.colspan as number) ?? 1
+    })
+    const cells: TableCell[] = []
+    let headerCellCount = 0
+    for (const cellNode of cellNodes) {
       const isHeader = cellNode.type.name === 'tableHeader'
+      if (isHeader) headerCellCount++
       const cellChildren: Paragraph[] = []
       cellNode.forEach((p) => {
         const converted = convertBlock(p, { list: null, blockquote: false })
@@ -328,20 +343,23 @@ function convertTable(node: ProseMirrorNode): Table {
       if (cellChildren.length === 0) cellChildren.push(new Paragraph({ text: '' }))
       const colspan = (cellNode.attrs.colspan as number) ?? 1
       const rowspan = (cellNode.attrs.rowspan as number) ?? 1
+      // Width proportional to this cell's colspan relative to total columns.
+      const cellWidth = totalCols > 0 ? Math.floor((100 * colspan) / totalCols) : 100
       cells.push(
         new TableCell({
           children: cellChildren,
           columnSpan: colspan > 1 ? colspan : undefined,
           rowSpan: rowspan > 1 ? rowspan : undefined,
-          width: { size: 100, type: WidthType.PERCENTAGE },
+          width: { size: cellWidth, type: WidthType.PERCENTAGE },
           shading: isHeader
             ? { type: ShadingType.CLEAR, color: 'auto', fill: 'EEEEEE' }
             : undefined,
         }),
       )
-    })
-    rows.push(new TableRow({ children: cells, tableHeader: rowIndex === 0 }))
-    rowIndex++
+    }
+    // Only mark as table header row if ALL cells in the row are header cells.
+    const isHeaderRow = cellNodes.length > 0 && headerCellCount === cellNodes.length
+    rows.push(new TableRow({ children: cells, tableHeader: isHeaderRow }))
   })
   return new Table({
     rows,
@@ -427,4 +445,15 @@ function decodeDataUri(src: string): DecodedImage | null {
   } catch {
     return null
   }
+}
+
+/**
+ * Parse a pixel dimension that may be a number, a numeric string, or a
+ * CSS-like string (e.g. "400px"). Falls back to `fallback` if parsing fails.
+ */
+function parsePx(value: number | string | undefined, fallback: number): number {
+  if (value === undefined || value === null) return fallback
+  if (typeof value === 'number') return value
+  const parsed = parseInt(value.replace(/px$/i, '').trim(), 10)
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback
 }

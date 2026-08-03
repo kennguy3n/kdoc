@@ -176,10 +176,17 @@ export function EditorPage() {
       setDocxError('')
       try {
         const { html, title } = await importDocxToHtml(file)
+        // Clear any pending auto-save timer before replacing content,
+        // otherwise it would fire with the stale old title and overwrite
+        // our explicit save below.
+        if (saveTimerRef.current) {
+          clearTimeout(saveTimerRef.current)
+          saveTimerRef.current = null
+        }
         editor.commands.setContent(html)
         setDocTitle(title)
         renameDocument(docId, title)
-        // Persist imported content immediately.
+        // Persist imported content immediately with the correct title.
         saveDocument(docId, editor.getHTML(), title)
         setSaveStatus('saved')
       } catch (err) {

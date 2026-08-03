@@ -65,9 +65,9 @@ export async function importDocxToHtml(file: File): Promise<DocxImportResult> {
  * Mammoth produces clean HTML, but some structures don't map 1:1 to
  * TipTap's node schema:
  * - Tables: mammoth emits <table><tr><td>; TipTap's Table extension
- *   parses fine without <tbody>, but we ensure cells have at least one
- *   <p> child (required by TipTap's TableCell).
+ *   requires each cell to contain at least one <p> child.
  * - Empty paragraphs: collapse runs of 3+ into one.
+ * - <br> tags inside <p>: convert to hardBreak-compatible markup.
  * - Nested lists: mammoth uses <ul>|<ol> selectors which produce valid
  *   nesting; no change needed.
  */
@@ -76,23 +76,32 @@ function postProcessHtml(html: string): string {
 
   let out = html
 
+  // Convert <br> inside paragraphs to TipTap hardBreak format. TipTap
+  // parses <br> as hardBreak natively, so this is actually a no-op, but
+  // we normalize self-closing variants for consistency.
+  out = out.replace(/<br\s*\/?>/gi, '<br>')
+
   // Ensure every <td>/<th> has at least one <p> child (TipTap requirement).
-  // If the cell already starts with a block element, leave it; otherwise
-  // wrap inline content in <p>.
-  out = out.replace(
-    /<(td|th)([^>]*)>([\s\S]*?)<\/\1>/gi,
-    (match, tag: string, attrs: string, content: string) => {
-      const trimmed = content.trim()
-      if (!trimmed) {
-        return `<${tag}${attrs}><p></p></${tag}>`
-      }
-      // If content already starts with a block-level element, leave as-is.
-      if (/^<(p|h[1-6]|ul|ol|blockquote|table|pre)/i.test(trimmed)) {
-        return match
-      }
-      return `<${tag}${attrs}><p>${trimmed}</p></${tag}>`
-    },
-  )
+  // We process cells from the inside out to handle nested tables correctly.
+  // The regex matches the innermost cells first (no nested <td>/<th>).
+  let prev: string
+  do {
+    prev = out
+    out = out.replace(
+      /<(td|th)([^>]*)>((?:(?!<\/?\1)[\s\S])*)<\/\1>/gi,
+      (match, tag: string, attrs: string, content: string) => {
+        const trimmed = content.trim()
+        if (!trimmed) {
+          return `<${tag}${attrs}><p></p></${tag}>`
+        }
+        // If content already starts with a block-level element, leave as-is.
+        if (/^<(p|h[1-6]|ul|ol|blockquote|table|pre)/i.test(trimmed)) {
+          return match
+        }
+        return `<${tag}${attrs}><p>${trimmed}</p></${tag}>`
+      },
+    )
+  } while (out !== prev)
 
   // Collapse multiple consecutive empty paragraphs into one.
   out = out.replace(/(<p>\s*<\/p>\s*){3,}/g, '<p></p>')
