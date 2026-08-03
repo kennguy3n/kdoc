@@ -5,10 +5,17 @@ export interface AIWorkflowDef {
   icon: string
   needsTopic: boolean
   needsSelection: boolean
+  supportsKeywords?: boolean
+  topicLabel?: string
   maxTokens: number
   temperature: number
   stop?: string[]
-  buildPrompt: (topic: string, selection: string, context?: string) => {system: string; user: string}
+  buildPrompt: (topic: string, selection: string, context?: string, keywords?: string) => {system: string; user: string}
+}
+
+function keywordLine(keywords?: string): string {
+  const trimmed = keywords?.trim()
+  return trimmed ? `\nKeywords to cover: "${trimmed}"` : ''
 }
 
 export const AI_WORKFLOWS: Record<string, AIWorkflowDef> = {
@@ -19,12 +26,30 @@ export const AI_WORKFLOWS: Record<string, AIWorkflowDef> = {
     icon: 'ListTree',
     needsTopic: true,
     needsSelection: false,
+    supportsKeywords: true,
     maxTokens: 800,
     temperature: 0.4,
     stop: ['<|im_end|>'],
-    buildPrompt: (topic) => ({
-      system: 'You are a writing assistant. Generate a document outline as markdown headings (## for sections, ### for subsections). Use bullet points with - for details. Output only the outline. No explanations.',
-      user: `Create an outline for: "${topic}"`,
+    buildPrompt: (topic, _selection, _context, keywords) => ({
+      system: 'You are a writing assistant. Generate a document outline as markdown headings (## for sections, ### for subsections). Use bullet points with - for details. Make sure the outline covers the given keywords. Output only the outline. No explanations.',
+      user: `Create an outline for: "${topic}"${keywordLine(keywords)}`,
+    }),
+  },
+  write_section_by_instruction: {
+    id: 'write_section_by_instruction',
+    label: 'Write Section by Instruction',
+    description: 'Write a section from an instruction: topic, keywords, requirements',
+    icon: 'PenLine',
+    needsTopic: true,
+    needsSelection: false,
+    supportsKeywords: true,
+    topicLabel: 'Instruction',
+    maxTokens: 600,
+    temperature: 0.5,
+    stop: ['<|im_end|>'],
+    buildPrompt: (topic, _selection, context, keywords) => ({
+      system: 'You are a writing assistant. Write a document section following the instruction. Cover the given keywords naturally. Match the document style when context is provided. Write 2-4 paragraphs. Output only the content, no headings, no explanations.',
+      user: `Instruction: "${topic}"${keywordLine(keywords)}${context?.trim() ? `\nDocument context: "${context}"` : ''}`,
     }),
   },
   write_section: {
@@ -49,12 +74,13 @@ export const AI_WORKFLOWS: Record<string, AIWorkflowDef> = {
     icon: 'Sparkles',
     needsTopic: true,
     needsSelection: false,
+    supportsKeywords: true,
     maxTokens: 1500,
     temperature: 0.5,
     stop: ['<|im_end|>'],
-    buildPrompt: (topic) => ({
-      system: 'You are a writing assistant. Generate a complete document based on the brief. Use markdown headings (##) for sections. Use bullet points with - for lists. Write clear, well-structured content. Output only the document.',
-      user: `Write a document about: "${topic}"`,
+    buildPrompt: (topic, _selection, _context, keywords) => ({
+      system: 'You are a writing assistant. Generate a complete document based on the brief. Use markdown headings (##) for sections. Use bullet points with - for lists. Cover the given keywords. Write clear, well-structured content. Output only the document.',
+      user: `Write a document about: "${topic}"${keywordLine(keywords)}`,
     }),
   },
   brainstorm_ideas: {

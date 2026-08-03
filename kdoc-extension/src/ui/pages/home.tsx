@@ -3,23 +3,39 @@ import {
   FileText,
   Lightbulb,
   ListChecks,
+  Loader2,
   Mail,
   PenLine,
   Plus,
   Search,
   Trash2,
+  Upload,
   Users,
   X,
   type LucideIcon,
 } from 'lucide-react'
-import {useCallback, useEffect, useMemo, useState, type MouseEvent} from 'react'
-import {useNavigate} from 'react-router-dom'
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ChangeEvent,
+  type MouseEvent,
+} from 'react'
+import { useNavigate } from 'react-router-dom'
 
-import {EmptyState} from '@/ui/components/primitives'
-import {Button} from '@/ui/components/primitives'
-import {createDocument, deleteDocument, listDocuments, type KDocDocument} from '@/ui/lib/doc-storage'
-import {DOC_TEMPLATES, type DocTemplate} from '@/ui/lib/doc-templates'
-import {cn} from '@/ui/utils'
+import { EmptyState } from '@/ui/components/primitives'
+import { Button } from '@/ui/components/primitives'
+import {
+  createDocument,
+  deleteDocument,
+  listDocuments,
+  type KDocDocument,
+} from '@/ui/lib/doc-storage'
+import { DOC_TEMPLATES, type DocTemplate } from '@/ui/lib/doc-templates'
+import { importDocxToHtml } from '@/ui/lib/docx-import'
+import { cn } from '@/ui/utils'
 
 const TEMPLATE_ICONS: Record<string, LucideIcon> = {
   FileText,
@@ -36,6 +52,9 @@ export function HomePage() {
   const [documents, setDocuments] = useState<KDocDocument[]>([])
   const [search, setSearch] = useState('')
   const [showTemplates, setShowTemplates] = useState(false)
+  const [importing, setImporting] = useState(false)
+  const [importError, setImportError] = useState('')
+  const fileInputRef = useRef<HTMLInputElement>(null)
 
   const refresh = useCallback(() => {
     setDocuments(listDocuments())
@@ -76,29 +95,83 @@ export function HomePage() {
     [navigate],
   )
 
+  const handleImportClick = useCallback(() => {
+    setImportError('')
+    fileInputRef.current?.click()
+  }, [])
+
+  const handleImportFile = useCallback(
+    async (e: ChangeEvent<HTMLInputElement>) => {
+      const file = e.target.files?.[0]
+      // Reset input so the same file can be re-selected later.
+      e.target.value = ''
+      if (!file) return
+      if (!/\.docx$/i.test(file.name)) {
+        setImportError('Please select a .docx file.')
+        return
+      }
+      setImporting(true)
+      setImportError('')
+      try {
+        const { html, title } = await importDocxToHtml(file)
+        const doc = createDocument(title, html)
+        navigate(`/editor?doc=${doc.id}`)
+      } catch (err) {
+        console.error('docx import failed:', err)
+        setImportError(err instanceof Error ? err.message : 'Failed to import .docx file.')
+      } finally {
+        setImporting(false)
+      }
+    },
+    [navigate],
+  )
+
   return (
     <div className="flex h-full flex-col">
-      <header className="flex items-center justify-between border-b border-border px-6 py-4">
+      <header className="border-border flex items-center justify-between border-b px-6 py-4">
         <div className="flex items-center gap-2">
-          <FileText className="h-5 w-5 text-brand" />
-          <h1 className="text-lg font-semibold text-fg">KDoc</h1>
+          <FileText className="text-brand h-5 w-5" />
+          <h1 className="text-fg text-lg font-semibold">KDoc</h1>
         </div>
-        <Button variant="primary" size="sm" onClick={() => setShowTemplates(true)}>
-          <Plus className="h-4 w-4" />
-          New Document
-        </Button>
+        <div className="flex items-center gap-2">
+          <Button variant="ghost" size="sm" onClick={handleImportClick} disabled={importing}>
+            {importing ? (
+              <Loader2 className="h-4 w-4 animate-spin" />
+            ) : (
+              <Upload className="h-4 w-4" />
+            )}
+            Import .docx
+          </Button>
+          <Button variant="primary" size="sm" onClick={() => setShowTemplates(true)}>
+            <Plus className="h-4 w-4" />
+            New Document
+          </Button>
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept=".docx,application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+            onChange={handleImportFile}
+            className="hidden"
+          />
+        </div>
       </header>
+
+      {importError && (
+        <div className="border-danger/30 bg-danger/10 text-danger mx-6 mt-3 rounded-lg border px-3 py-2 text-xs">
+          {importError}
+        </div>
+      )}
 
       <div className="px-6 py-3">
         <div className="relative">
-          <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted" />
+          <Search className="text-muted absolute top-1/2 left-3 h-4 w-4 -translate-y-1/2" />
           <input
             type="text"
             placeholder="Search documents..."
             value={search}
             onChange={(e) => setSearch(e.target.value)}
             className={cn(
-              'w-full rounded-lg border border-border bg-surface py-2 pl-9 pr-3 text-sm text-fg',
+              'border-border bg-surface text-fg w-full rounded-lg border py-2 pr-3 pl-9 text-sm',
               'placeholder:text-muted focus:border-brand focus:outline-none',
             )}
           />
@@ -110,7 +183,9 @@ export function HomePage() {
           <EmptyState
             icon={FileText}
             title={search ? 'No documents found' : 'No documents yet'}
-            description={search ? 'Try a different search term.' : 'Create your first document to get started.'}
+            description={
+              search ? 'Try a different search term.' : 'Create your first document to get started.'
+            }
             action={
               !search && (
                 <Button variant="primary" onClick={() => setShowTemplates(true)}>
@@ -132,17 +207,17 @@ export function HomePage() {
                   if (e.key === 'Enter') handleOpen(doc.id)
                 }}
                 className={cn(
-                  'group flex flex-col gap-1 rounded-xl border border-border bg-surface p-4 text-left',
-                  'transition-colors hover:border-brand/50 hover:bg-surface-2 cursor-pointer',
+                  'group border-border bg-surface flex flex-col gap-1 rounded-xl border p-4 text-left',
+                  'hover:border-brand/50 hover:bg-surface-2 cursor-pointer transition-colors',
                 )}
               >
                 <div className="flex items-start justify-between gap-2">
-                  <FileText className="mt-0.5 h-4 w-4 shrink-0 text-muted" />
+                  <FileText className="text-muted mt-0.5 h-4 w-4 shrink-0" />
                   <button
                     type="button"
                     onClick={(e) => handleDelete(doc.id, e)}
                     className={cn(
-                      'rounded p-1 text-muted opacity-0 transition-opacity',
+                      'text-muted rounded p-1 opacity-0 transition-opacity',
                       'hover:bg-danger/10 hover:text-danger group-hover:opacity-100',
                     )}
                     aria-label="Delete document"
@@ -150,8 +225,8 @@ export function HomePage() {
                     <Trash2 className="h-3.5 w-3.5" />
                   </button>
                 </div>
-                <h3 className="truncate text-sm font-medium text-fg">{doc.title}</h3>
-                <p className="text-xs text-muted">
+                <h3 className="text-fg truncate text-sm font-medium">{doc.title}</h3>
+                <p className="text-muted text-xs">
                   {new Date(doc.updatedAt).toLocaleDateString(undefined, {
                     month: 'short',
                     day: 'numeric',
@@ -170,15 +245,15 @@ export function HomePage() {
           onClick={() => setShowTemplates(false)}
         >
           <div
-            className="w-full max-w-2xl rounded-2xl border border-border bg-surface p-6 shadow-xl"
+            className="border-border bg-surface w-full max-w-2xl rounded-2xl border p-6 shadow-xl"
             onClick={(e) => e.stopPropagation()}
           >
             <div className="mb-4 flex items-center justify-between">
-              <h2 className="text-lg font-semibold text-fg">Choose a Template</h2>
+              <h2 className="text-fg text-lg font-semibold">Choose a Template</h2>
               <button
                 type="button"
                 onClick={() => setShowTemplates(false)}
-                className="rounded p-1 text-muted hover:bg-surface-2 hover:text-fg"
+                className="text-muted hover:bg-surface-2 hover:text-fg rounded p-1"
               >
                 <X className="h-4 w-4" />
               </button>
@@ -192,13 +267,13 @@ export function HomePage() {
                     type="button"
                     onClick={() => handleCreateFromTemplate(template)}
                     className={cn(
-                      'flex flex-col items-start gap-2 rounded-xl border border-border p-4 text-left',
-                      'transition-colors hover:border-brand/50 hover:bg-surface-2',
+                      'border-border flex flex-col items-start gap-2 rounded-xl border p-4 text-left',
+                      'hover:border-brand/50 hover:bg-surface-2 transition-colors',
                     )}
                   >
-                    <Icon className="h-5 w-5 text-brand" />
-                    <span className="text-sm font-medium text-fg">{template.label}</span>
-                    <span className="text-xs text-muted">{template.description}</span>
+                    <Icon className="text-brand h-5 w-5" />
+                    <span className="text-fg text-sm font-medium">{template.label}</span>
+                    <span className="text-muted text-xs">{template.description}</span>
                   </button>
                 )
               })}

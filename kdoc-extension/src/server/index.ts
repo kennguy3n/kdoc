@@ -1,10 +1,10 @@
-import {defineExtensionCommand, type ExtensionContext} from '@kchat/sdk/server'
+import { defineExtensionCommand, type ExtensionContext } from '@kchat/sdk/server'
 
 let ctx: ExtensionContext | null = null
 
 export async function activate(context: ExtensionContext) {
   ctx = context
-  const {host, logger} = context
+  const { host, logger } = context
 
   logger.info('KDoc extension activated')
 
@@ -13,7 +13,7 @@ export async function activate(context: ExtensionContext) {
       id: 'kennguy3n.kdoc.ai-skill',
       title: 'AI Skill',
       handler: async (args: Record<string, unknown>) => {
-        const {skill_id} = args as {skill_id: string}
+        const { skill_id } = args as { skill_id: string }
         logger.info(`AI skill invoked: ${skill_id}`)
         return {
           skill_id,
@@ -29,12 +29,27 @@ export async function activate(context: ExtensionContext) {
       id: 'kennguy3n.kdoc.export',
       title: 'Export Document',
       handler: async (args: Record<string, unknown>) => {
-        const {doc_id, format} = args as {doc_id: string; format: string}
+        const { doc_id, format } = args as { doc_id: string; format: string }
         logger.info(`Export requested: doc=${doc_id}, format=${format}`)
         return {
           doc_id,
           format,
           status: 'Export is handled client-side.',
+        }
+      },
+    }),
+  )
+
+  context.subscriptions.push(
+    defineExtensionCommand(host, {
+      id: 'kennguy3n.kdoc.import',
+      title: 'Import Document',
+      handler: async (args: Record<string, unknown>) => {
+        const { filename } = args as { filename?: string }
+        logger.info(`Import requested: ${filename ?? '(unknown file)'}`)
+        return {
+          filename,
+          status: 'Import is handled client-side via mammoth.',
         }
       },
     }),

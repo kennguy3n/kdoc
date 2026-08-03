@@ -102,6 +102,7 @@ export interface AIPanelProps {
 export function AIPanel({editor, open, onClose}: AIPanelProps) {
   const [activeWorkflow, setActiveWorkflow] = useState<AIWorkflowDef | null>(null)
   const [topic, setTopic] = useState('')
+  const [keywords, setKeywords] = useState('')
   const [output, setOutput] = useState('')
   const [status, setStatus] = useState<'idle' | 'streaming' | 'done' | 'error'>('idle')
   const outputRef = useRef<HTMLDivElement>(null)
@@ -143,7 +144,7 @@ export function AIPanel({editor, open, onClose}: AIPanelProps) {
       setOutput('')
       setStatus('streaming')
 
-      const {system, user} = workflow.buildPrompt(topicText, selection, context)
+      const {system, user} = workflow.buildPrompt(topicText, selection, context, keywords)
 
       await engine.runSkill(
         {
@@ -175,7 +176,7 @@ export function AIPanel({editor, open, onClose}: AIPanelProps) {
         },
       )
     },
-    [editor, topic],
+    [editor, topic, keywords],
   )
 
   const handleInsert = useCallback(() => {
@@ -240,6 +241,7 @@ export function AIPanel({editor, open, onClose}: AIPanelProps) {
                 setActiveWorkflow(null)
                 setOutput('')
                 setStatus('idle')
+                setKeywords('')
               }}
               className="text-xs text-muted hover:text-fg"
             >
@@ -249,7 +251,7 @@ export function AIPanel({editor, open, onClose}: AIPanelProps) {
             <div>
               <label className="mb-1 block text-xs font-medium text-fg">
                 {activeWorkflow.needsTopic
-                  ? 'Topic / Brief'
+                  ? (activeWorkflow.topicLabel ?? 'Topic / Brief')
                   : activeWorkflow.needsSelection
                     ? 'Selected text will be used'
                     : 'Document context will be used'}
@@ -273,6 +275,24 @@ export function AIPanel({editor, open, onClose}: AIPanelProps) {
                 />
               )}
             </div>
+
+            {activeWorkflow.needsTopic && activeWorkflow.supportsKeywords && (
+              <div>
+                <label className="mb-1 block text-xs font-medium text-fg">
+                  Keywords <span className="text-muted">(optional)</span>
+                </label>
+                <input
+                  type="text"
+                  value={keywords}
+                  onChange={(e) => setKeywords(e.target.value)}
+                  placeholder="e.g. onboarding, pricing, API"
+                  className={cn(
+                    'w-full rounded-lg border border-border bg-surface p-2 text-sm text-fg',
+                    'placeholder:text-muted focus:border-brand focus:outline-none',
+                  )}
+                />
+              </div>
+            )}
 
             <button
               type="button"

@@ -60,6 +60,10 @@
       {
         "id": "kennguy3n.kdoc.export",
         "title": "Export Document"
+      },
+      {
+        "id": "kennguy3n.kdoc.import",
+        "title": "Import Document"
       }
     ]
   },
