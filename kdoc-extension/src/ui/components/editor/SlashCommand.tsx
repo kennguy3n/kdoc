@@ -5,7 +5,8 @@ import {createRoot, type Root} from 'react-dom/client'
 import type {SuggestionProps} from '@tiptap/suggestion'
 
 import {SlashMenuView} from './SlashMenuView'
-import {AI_SKILLS} from '@/ui/lib/ai-skills'
+import {SLASH_ACTIONS} from '@/ui/lib/ai-actions'
+import {getLocalContext} from '@/ui/lib/token-context'
 
 export interface SlashCommandItem {
   title: string
@@ -101,19 +102,19 @@ const BLOCK_COMMANDS: SlashCommandItem[] = [
   },
 ]
 
-const AI_COMMANDS: SlashCommandItem[] = Object.values(AI_SKILLS).map((skill) => ({
-  title: skill.label,
-  description: skill.description,
-  icon: skill.icon,
+const AI_COMMANDS: SlashCommandItem[] = SLASH_ACTIONS.map((action) => ({
+  title: action.label,
+  description: action.description,
+  icon: action.icon,
   category: 'ai' as const,
   command: ({editor, range}) => {
     editor.chain().focus().deleteRange(range).run()
     const {from, to} = editor.state.selection
     const selection = editor.state.doc.textBetween(from, to, '\n')
-    const context = editor.getText().slice(0, 500)
+    const context = getLocalContext(editor, from, to)
     window.dispatchEvent(
       new CustomEvent('kdoc:ai-skill', {
-        detail: {skillId: skill.id, selection, context, from, to},
+        detail: {skillId: action.id, selection, context, from, to},
       }),
     )
   },

@@ -1,31 +1,10 @@
 import type {Editor} from '@tiptap/react'
-import {
-  CheckCheck,
-  ChevronRight,
-  FileText,
-  Heading,
-  Lightbulb,
-  ListChecks,
-  MessageSquare,
-  Sparkles,
-  Wand2,
-  type LucideIcon,
-} from 'lucide-react'
+import {ChevronRight, MessageSquare} from 'lucide-react'
 import {useCallback, useEffect, useRef, useState} from 'react'
 
-import {SELECTION_SKILLS, type AISkillDef, type AISkillSubVariant} from '@/ui/lib/ai-skills'
+import {SELECTION_ACTIONS, type AIActionDef, type AIActionSubVariant} from '@/ui/lib/ai-actions'
+import {ACTION_ICONS, DEFAULT_ACTION_ICON} from '@/ui/lib/ai-icons'
 import {cn} from '@/ui/utils'
-
-const ICONS: Record<string, LucideIcon> = {
-  Sparkles,
-  Wand2,
-  Lightbulb,
-  FileText,
-  CheckCheck,
-  Heading,
-  ListChecks,
-  MessageSquare,
-}
 
 export interface AISelectionMenuProps {
   editor: Editor | null
@@ -33,8 +12,8 @@ export interface AISelectionMenuProps {
 }
 
 interface MenuItem {
-  skill: AISkillDef
-  variant?: AISkillSubVariant
+  skill: AIActionDef
+  variant?: AIActionSubVariant
 }
 
 export function AISelectionMenu({editor, onSkillTrigger}: AISelectionMenuProps) {
@@ -48,7 +27,7 @@ export function AISelectionMenu({editor, onSkillTrigger}: AISelectionMenuProps) 
   const selectionRef = useRef<{from: number; to: number} | null>(null)
   const containerRef = useRef<HTMLDivElement>(null)
 
-  const menuItems: MenuItem[] = SELECTION_SKILLS.map((s) => ({skill: s}))
+  const menuItems: MenuItem[] = SELECTION_ACTIONS.map((s) => ({skill: s}))
 
   useEffect(() => {
     if (!editor) return
@@ -182,7 +161,7 @@ export function AISelectionMenu({editor, onSkillTrigger}: AISelectionMenuProps) 
 
   if (!editor || !visible) return null
 
-  const activeSubmenuSkill = submenuFor ? SELECTION_SKILLS.find((s) => s.id === submenuFor) : null
+  const activeSubmenuSkill = submenuFor ? SELECTION_ACTIONS.find((s) => s.id === submenuFor) : null
 
   return (
     <div
@@ -218,7 +197,7 @@ export function AISelectionMenu({editor, onSkillTrigger}: AISelectionMenuProps) 
       ) : (
         <div className="py-1">
           {menuItems.map(({skill}, idx) => {
-            const Icon = ICONS[skill.icon] ?? Sparkles
+            const Icon = ACTION_ICONS[skill.icon] ?? DEFAULT_ACTION_ICON
             const hasSub = skill.subVariants && skill.subVariants.length > 0
             const isActive = idx === selectedIndex
             return (

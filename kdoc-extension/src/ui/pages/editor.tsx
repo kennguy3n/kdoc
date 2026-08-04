@@ -5,7 +5,6 @@ import {
   Download,
   FileDown,
   Loader2,
-  PanelRight,
   Sparkles,
   Upload,
   X,
@@ -21,11 +20,15 @@ import { FormattingBubbleMenu } from '@/ui/components/editor/FormattingBubbleMen
 import { GhostBlock, type GhostBlockState } from '@/ui/components/editor/GhostBlock'
 import { buildExtensions } from '@/ui/components/editor/extensions'
 import { Button } from '@/ui/components/primitives'
-import { AI_SKILLS, type AISkillMode } from '@/ui/lib/ai-skills'
+import { AI_ACTIONS, type AIActionMode } from '@/ui/lib/ai-actions'
 import { getAIEngine } from '@/ui/lib/ai-engine'
+import { adaptiveMaxOutput, budgetForContext, truncateContext } from '@/ui/lib/token-budget'
+import { extractOutlineContext } from '@/ui/lib/doc-chunking'
+import { getLocalContext } from '@/ui/lib/token-context'
 import { getDocument, renameDocument, saveDocument } from '@/ui/lib/doc-storage'
 import { importDocxToHtml } from '@/ui/lib/docx-import'
 import { exportDocx } from '@/ui/lib/docx-export'
+import { exportPdf } from '@/ui/lib/pdf-export'
 
 export function EditorPage() {
   const navigate = useNavigate()
@@ -40,7 +43,8 @@ export function EditorPage() {
   const [ghostError, setGhostError] = useState('')
   const ghostRangeRef = useRef<{ from: number; to: number } | null>(null)
   const ghostOriginalRef = useRef<string>('')
-  const ghostModeRef = useRef<AISkillMode>('insert')
+  const ghostModeRef = useRef<AIActionMode>('insert')
+  const ghostErroredRef = useRef(false)
   const [aiPanelOpen, setAiPanelOpen] = useState(false)
   const [customPrompt, setCustomPrompt] = useState('')
   const [customPromptOpen, setCustomPromptOpen] = useState(false)
@@ -128,6 +132,27 @@ export function EditorPage() {
     a.click()
     URL.revokeObjectURL(url)
     setExportMenuOpen(false)
+  }, [editor, docTitle])
+
+  const handleExportPdf = useCallback(async () => {
+    if (!editor) return
+    setExporting(true)
+    setDocxError('')
+    setExportMenuOpen(false)
+    try {
+      const blob = await exportPdf(editor, docTitle)
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = `${docTitle || 'untitled'}.pdf`
+      a.click()
+      URL.revokeObjectURL(url)
+    } catch (err) {
+      console.error('pdf export failed:', err)
+      setDocxError(err instanceof Error ? err.message : 'Failed to export .pdf.')
+    } finally {
+      setExporting(false)
+    }
   }, [editor, docTitle])
 
   const handleExportDocx = useCallback(async () => {
@@ -244,29 +269,74 @@ export function EditorPage() {
     async (skillId: string, selection: string, context: string) => {
       if (!editor) return
 
-      let skill: (typeof AI_SKILLS)[string] | undefined = AI_SKILLS[skillId]
-      let skillContext = context
+      let action: (typeof AI_ACTIONS)[string] | undefined = AI_ACTIONS[skillId]
+      let actionContext = context
 
       if (skillId === 'custom_instruction') {
-        skill = {
+        action = {
           id: 'custom_instruction',
           label: 'Custom',
           description: context,
           icon: 'MessageSquare',
+          group: 'refine',
+          scope: 'selection',
+          mode: 'replace',
           maxTokens: 300,
           temperature: 0.4,
           stop: ['<|im_end|>'],
-          needsSelection: true,
-          mode: 'replace',
           buildPrompt: (sel, ctx) => ({
             system: `You are an editor. Follow the user's instruction to edit the text. Do not explain. Output only the result.`,
             user: `Instruction: ${ctx}\nText: "${sel}"`,
           }),
         }
-        skillContext = context
       }
 
-      if (!skill) return
+      if (!action) return
+
+      // For document-scoped actions, use the full document text as context
+      // (the slash menu sends only local context, which isn't enough).
+      // Apply budget-aware truncation so we don't overflow the context window.
+      if (action.needsFullDocument) {
+        const fullText =
+          action.id === 'improve_document'
+            ? editor.storage.markdown?.getMarkdown?.() ?? editor.getText()
+            : editor.getText()
+        const { system: sys, user: userWrapper } = action.buildPrompt('', '', undefined)
+        const maxCtxChars = budgetForContext(sys, action.maxTokens, userWrapper)
+        // Outline-context actions use a compact outline instead of full text,
+        // so they always fit. Other actions truncate + adapt maxTokens.
+        if (action.useOutlineContext) {
+          actionContext = extractOutlineContext(fullText)
+        } else {
+          actionContext = truncateContext(fullText, maxCtxChars)
+          action = {
+            ...action,
+            maxTokens: adaptiveMaxOutput(sys, actionContext, action.maxTokens, userWrapper),
+          }
+        }
+      }
+
+      // For selection-scoped rewrite actions, adaptively increase maxTokens
+      // based on selection length. A multi-paragraph selection needs more
+      // output tokens than the default 300 to avoid mid-sentence cutoff.
+      if (action.scope === 'selection' && action.mode === 'replace') {
+        const { system: sys } = action.buildPrompt(selection, actionContext)
+        const selTokens = Math.ceil(selection.length / 3)
+        // Output needs at least as many tokens as the input, plus headroom.
+        const needed = Math.ceil(selTokens * 1.3)
+        const maxAllowed = 4096 - 120 - 80 - Math.ceil(sys.length / 3) - Math.ceil(selection.length / 3)
+        action = {
+          ...action,
+          maxTokens: Math.min(Math.max(needed, action.maxTokens), Math.max(maxAllowed, 200)),
+        }
+      }
+
+      // Topic-scoped actions that need a topic input can't get one from the
+      // slash menu or highlight menu. Route them to the AI panel instead.
+      if (action.needsTopic && action.scope === 'topic') {
+        setAiPanelOpen(true)
+        return
+      }
 
       if (modelStatus !== 'loaded') {
         await loadModel()
@@ -275,21 +345,23 @@ export function EditorPage() {
       const engine = getAIEngine()
       if (!engine.isLoaded()) {
         setGhostError('AI model is loading or unavailable. Please wait and try again.')
+        ghostErroredRef.current = true
         setGhostState('error')
         setGhostVisible(true)
         return
       }
 
       const { from, to } = editor.state.selection
-      const originalText = skill.mode === 'replace' ? selection : ''
-      ghostModeRef.current = skill.mode
+      const originalText = action.mode === 'replace' ? selection : ''
+      ghostModeRef.current = action.mode
       ghostOriginalRef.current = originalText
+      ghostErroredRef.current = false
       setGhostState('streaming')
       setGhostVisible(true)
       setGhostError('')
 
       // For replace mode: delete selection immediately so AI text appears in place
-      if (skill.mode === 'replace') {
+      if (action.mode === 'replace') {
         editor.chain().focus().deleteRange({ from, to }).run()
         ghostRangeRef.current = { from, to: from }
       } else {
@@ -304,34 +376,82 @@ export function EditorPage() {
         left: coords.left - editorRect.left,
       })
 
-      await engine.runSkill(skill, selection, skillContext, {
-        onToken: (token) => {
-          // Insert token inline with ghost mark
-          if (editor && ghostRangeRef.current) {
-            const insertAt = ghostRangeRef.current.to
-            editor
-              .chain()
-              .focus()
-              .insertContentAt(insertAt, { type: 'text', text: token }, { updateSelection: false })
-              .setTextSelection({ from: insertAt, to: insertAt + token.length })
-              .setMark('ghostMark')
-              .setTextSelection(insertAt + token.length)
-              .run()
-            ghostRangeRef.current = {
-              from: ghostRangeRef.current.from,
-              to: insertAt + token.length,
-            }
-          }
-        },
-        onDone: () => {
-          setGhostState('done')
-        },
-        onError: (error) => {
-          console.error('AI skill error:', error)
-          setGhostError(error)
-          setGhostState('error')
-        },
-      })
+      // Insert a token inline with ghost mark, tracking the insertion range.
+      const insertGhostToken = (token: string) => {
+        if (!editor || !ghostRangeRef.current) return
+        const insertAt = ghostRangeRef.current.to
+        editor
+          .chain()
+          .focus()
+          .insertContentAt(insertAt, { type: 'text', text: token }, { updateSelection: false })
+          .setTextSelection({ from: insertAt, to: insertAt + token.length })
+          .setMark('ghostMark')
+          .setTextSelection(insertAt + token.length)
+          .run()
+        ghostRangeRef.current = {
+          from: ghostRangeRef.current.from,
+          to: insertAt + token.length,
+        }
+      }
+
+      // Run with continuation support for selection rewrite actions.
+      // When the model hits max_tokens mid-sentence, continue from where it
+      // stopped so the full rewritten text is produced.
+      let fullOutput = ''
+      let currentUser = selection
+      const { system: skillSystem } = action.buildPrompt(selection, actionContext)
+      const maxIterations = 5
+
+      for (let iteration = 0; iteration < maxIterations; iteration++) {
+        let wasCutOff = false
+        let chunkOutput = ''
+        const isLast = iteration === maxIterations - 1
+
+        await engine.runSkill(
+          {
+            ...action,
+            buildPrompt: () => ({
+              system: skillSystem,
+              user: currentUser,
+            }),
+          },
+          '',
+          '',
+          {
+            onToken: (token) => {
+              chunkOutput += token
+              fullOutput += token
+              insertGhostToken(token)
+            },
+            onCutOff: () => {
+              wasCutOff = true
+            },
+            onDone: () => {},
+            onError: (error) => {
+              console.error('AI skill error:', error)
+              setGhostError(error)
+              ghostErroredRef.current = true
+              setGhostState('error')
+            },
+          },
+        )
+
+        // If not cut off, or produced very little, we're done.
+        if (!wasCutOff || chunkOutput.trim().length < 10 || isLast) {
+          break
+        }
+
+        // Prepare continuation: append the last output and ask for more.
+        const tail = fullOutput.slice(-500)
+        currentUser =
+          `Continue from exactly where you stopped. Do not repeat any text you already wrote.\n` +
+          `Last 500 characters of your previous output:\n"""\n${tail}\n"""\n` +
+          `Continue from this point. Output only the continuation:`
+      }
+
+      if (!ghostErroredRef.current) {
+        setGhostState('done')
+      }
     },
     [editor, modelStatus, loadModel],
   )
@@ -390,9 +510,9 @@ export function EditorPage() {
 
   const handleContinueWriting = useCallback(() => {
     if (!editor) return
-    const text = editor.getText()
-    const lastWords = text.slice(-200)
-    triggerAISkill('continue_writing', '', lastWords)
+    const {from} = editor.state.selection
+    const context = getLocalContext(editor, from, from, 600)
+    triggerAISkill('continue_writing', '', context)
   }, [editor, triggerAISkill])
 
   useEffect(() => {
@@ -560,6 +680,14 @@ export function EditorPage() {
                 </button>
                 <button
                   type="button"
+                  onClick={handleExportPdf}
+                  className="text-fg hover:bg-surface-2 flex w-full items-center gap-2 px-3 py-1.5 text-left text-xs transition-colors"
+                >
+                  <FileDown className="h-3.5 w-3.5" />
+                  PDF (.pdf)
+                </button>
+                <button
+                  type="button"
                   onClick={handleExportMarkdown}
                   className="text-fg hover:bg-surface-2 flex w-full items-center gap-2 px-3 py-1.5 text-left text-xs transition-colors"
                 >
@@ -569,19 +697,14 @@ export function EditorPage() {
               </div>
             )}
           </div>
-          <Button
-            variant={aiPanelOpen ? 'primary' : 'ghost'}
-            size="sm"
-            onClick={() => setAiPanelOpen((prev) => !prev)}
-            title="Writing Tools (Cmd+K)"
-          >
-            <PanelRight className="h-3.5 w-3.5" />
-            Writing
-          </Button>
         </div>
       </header>
 
-      <EditorToolbar editor={editor} />
+      <EditorToolbar
+        editor={editor}
+        aiPanelOpen={aiPanelOpen}
+        onToggleAIPanel={() => setAiPanelOpen((prev) => !prev)}
+      />
 
       <div className="flex flex-1 overflow-hidden">
         <div className="flex-1 overflow-y-auto">

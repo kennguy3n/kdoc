@@ -1,31 +1,24 @@
 import type { Editor } from '@tiptap/react'
 import {
-  AlignLeft,
-  Heading,
-  Lightbulb,
-  ListTree,
   Loader2,
-  PenLine,
   Sparkles,
-  Wand2,
   X,
-  type LucideIcon,
 } from 'lucide-react'
 import { useCallback, useRef, useState } from 'react'
 
+import {
+  ACTIONS_BY_GROUP,
+  GROUP_LABELS,
+  GROUP_ORDER,
+  extractOutline,
+  type AIActionDef,
+  type AIActionGroup,
+} from '@/ui/lib/ai-actions'
 import { getAIEngine } from '@/ui/lib/ai-engine'
-import { WORKFLOW_LIST, type AIWorkflowDef } from '@/ui/lib/ai-workflows'
+import { ACTION_ICONS, DEFAULT_ACTION_ICON } from '@/ui/lib/ai-icons'
+import { chunkDocument, extractOutlineContext } from '@/ui/lib/doc-chunking'
+import { adaptiveMaxOutput, budgetForContext, truncateContext } from '@/ui/lib/token-budget'
 import { cn } from '@/ui/utils'
-
-const WORKFLOW_ICONS: Record<string, LucideIcon> = {
-  ListTree,
-  PenLine,
-  Sparkles,
-  Lightbulb,
-  Heading,
-  Wand2,
-  AlignLeft,
-}
 
 // --- Markdown → HTML conversion -----------------------------------------
 
@@ -184,6 +177,7 @@ async function runWithContinuation(
   onError: (err: string) => void,
   onContinuation?: (iteration: number) => void,
   maxIterations = 5,
+  responsePrefix?: string,
 ): Promise<void> {
   let fullOutput = ''
   let currentUser = initialUser
@@ -191,6 +185,7 @@ async function runWithContinuation(
   for (let iteration = 0; iteration < maxIterations; iteration++) {
     if (iteration > 0) onContinuation?.(iteration)
 
+    let wasCutOff = false
     const chunkOutput = await new Promise<string>((resolve, reject) => {
       let chunk = ''
       engine
@@ -200,19 +195,24 @@ async function runWithContinuation(
             label: 'Continuation',
             description: '',
             icon: 'Sparkles',
+            group: 'document',
+            scope: 'document',
+            mode: 'insert',
             maxTokens,
             temperature,
             stop,
-            needsSelection: false,
-            mode: 'insert',
+            responsePrefix: iteration === 0 ? responsePrefix : undefined,
             buildPrompt: () => ({ system, user: currentUser }),
-          } as never,
+          },
           '',
           '',
           {
             onToken: (token) => {
               chunk += token
               onToken(token)
+            },
+            onCutOff: () => {
+              wasCutOff = true
             },
             onDone: () => resolve(chunk),
             onError: (err) => reject(new Error(err)),
@@ -234,8 +234,9 @@ async function runWithContinuation(
       break
     }
 
-    // If the chunk doesn't look cut off, we're done.
-    if (!looksCutOff(chunkOutput, maxTokens)) {
+    // Use the backend's cut-off signal if available; fall back to heuristic.
+    const cutOff = wasCutOff || looksCutOff(chunkOutput, maxTokens)
+    if (!cutOff) {
       break
     }
 
@@ -250,6 +251,383 @@ async function runWithContinuation(
   onDone()
 }
 
+/**
+ * Sectioned generation for long documents: first generates an outline,
+ * then writes each section sequentially, stitching results together.
+ *
+ * This produces more coherent long documents than blind tail-continuation,
+ * because each section is written with full outline context and the model
+ * focuses on one section at a time.
+ */
+async function runSectionedGeneration(
+  engine: ReturnType<typeof getAIEngine>,
+  topic: string,
+  keywords: string,
+  maxTokens: number,
+  temperature: number,
+  stop: string[] | undefined,
+  onToken: (token: string) => void,
+  onDone: () => void,
+  onError: (err: string) => void,
+  onProgress?: (section: number, total: number, heading: string) => void,
+): Promise<void> {
+  // Step 1: Generate the outline
+  const outlineSystem =
+    'Generate a document outline as markdown headings (# for title, ## for sections). ' +
+    'Use bullet points (-) for key points under each section. Output only the outline.'
+  const outlineUser = `Create an outline for: ${topic}${keywords?.trim() ? `\nKeywords to cover: "${keywords}"` : ''}`
+
+  let outline = ''
+  let outlineFailed = false
+  await new Promise<void>((resolve, reject) => {
+    engine.runSkill(
+      {
+        id: 'outline_gen',
+        label: 'Outline',
+        description: '',
+        icon: 'ListTree',
+        group: 'generate',
+        scope: 'topic',
+        mode: 'insert',
+        maxTokens: 800,
+        temperature: 0.4,
+        stop,
+        responsePrefix: '# ',
+        buildPrompt: () => ({ system: outlineSystem, user: outlineUser }),
+      },
+      '',
+      '',
+      {
+        onToken: (token) => {
+          outline += token
+          onToken(token)
+        },
+        onDone: resolve,
+        onError: (err) => reject(new Error(err)),
+      },
+    )
+  }).catch((err) => {
+    onError(err instanceof Error ? err.message : String(err))
+    outlineFailed = true
+  })
+
+  if (outlineFailed || !outline.trim()) return
+
+  // Step 2: Parse sections from the outline (## headings only)
+  const sections = outline
+    .split('\n')
+    .filter((line) => /^##\s+/.test(line.trim()))
+    .map((line) => line.trim().replace(/^##\s+/, ''))
+
+  if (sections.length === 0) {
+    onDone()
+    return
+  }
+
+  // Step 3: Write each section
+  for (let i = 0; i < sections.length; i++) {
+    const heading = sections[i]
+    onProgress?.(i + 1, sections.length, heading)
+
+    // Emit the section heading before its content
+    onToken(`\n\n## ${heading}\n\n`)
+
+    const sectionSystem =
+      'Write a document section. Cover the key points from the outline. ' +
+      'Write 2-4 paragraphs. Output only the content, no heading. ' +
+      'Do not repeat content from other sections.'
+    const sectionUser =
+      `Write the section "${heading}" for a document about: ${topic}\n` +
+      `Full outline:\n${outline}`
+
+    let sectionFailed = false
+    await new Promise<void>((resolve, reject) => {
+      engine.runSkill(
+        {
+          id: 'section_gen',
+          label: 'Section',
+          description: '',
+          icon: 'PenLine',
+          group: 'generate',
+          scope: 'topic',
+          mode: 'insert',
+          maxTokens,
+          temperature,
+          stop,
+          buildPrompt: () => ({ system: sectionSystem, user: sectionUser }),
+        },
+        '',
+        '',
+        {
+          onToken: (token) => onToken(token),
+          onDone: resolve,
+          onError: (err) => reject(new Error(err)),
+        },
+      )
+    }).catch((err) => {
+      onError(err instanceof Error ? err.message : String(err))
+      sectionFailed = true
+    })
+
+    if (sectionFailed) return
+  }
+
+  onDone()
+}
+
+/**
+ * Chunked transform for large documents: splits the input into chunks at
+ * paragraph/heading boundaries, transforms each chunk independently (with
+ * the document outline provided for cross-section awareness), and stitches
+ * the results together.
+ *
+ * Used by improve_document and format_document when the document is too
+ * large to fit in the context window in a single pass.
+ */
+async function runChunkedTransform(
+  engine: ReturnType<typeof getAIEngine>,
+  system: string,
+  documentText: string,
+  maxTokens: number,
+  temperature: number,
+  stop: string[] | undefined,
+  onToken: (token: string) => void,
+  onDone: () => void,
+  onError: (err: string) => void,
+  onProgress?: (chunk: number, total: number) => void,
+): Promise<void> {
+  const outline = extractOutline(documentText)
+  const outlineLine = outline ? `\nDocument outline (for context):\n${outline}\n` : ''
+
+  // Adaptively size chunks based on outline length so the full request
+  // (system + outline + chunk + maxTokens + overhead) fits in 4096 tokens.
+  // Base chunk size is 6000 chars; reduce it if the outline is large.
+  const chunkInfoOverhead = 80 // "You are processing chunk N of M..." line
+  const fullSystemOverhead = system.length + outlineLine.length + chunkInfoOverhead
+  const maxChunkChars = Math.max(
+    2000,
+    Math.min(6000, (4096 - 120 - 80 - maxTokens) * 3 - fullSystemOverhead - 100),
+  )
+  const chunks = chunkDocument(documentText, maxChunkChars)
+
+  for (let i = 0; i < chunks.length; i++) {
+    const chunk = chunks[i]
+    onProgress?.(i + 1, chunks.length)
+
+    const chunkSystem =
+      system +
+      (outlineLine ? `\n${outlineLine}` : '') +
+      `\nYou are processing chunk ${i + 1} of ${chunks.length}. ` +
+      `Preserve formatting consistency with the rest of the document.`
+    const chunkUser = `Process this section:\n\n${chunk.text}`
+
+    // Per-chunk adaptive maxTokens as a safety net.
+    const chunkMaxTokens = adaptiveMaxOutput(chunkSystem, chunk.text, maxTokens, chunkUser)
+
+    let chunkFailed = false
+    await new Promise<void>((resolve, reject) => {
+      engine.runSkill(
+        {
+          id: 'chunk_transform',
+          label: 'Transform',
+          description: '',
+          icon: 'Wand2',
+          group: 'document',
+          scope: 'document',
+          mode: 'insert',
+          maxTokens: chunkMaxTokens,
+          temperature,
+          stop,
+          buildPrompt: () => ({system: chunkSystem, user: chunkUser}),
+        },
+        '',
+        '',
+        {
+          onToken: (token) => onToken(token),
+          onDone: resolve,
+          onError: (err) => reject(new Error(err)),
+        },
+      )
+    }).catch((err) => {
+      onError(err instanceof Error ? err.message : String(err))
+      chunkFailed = true
+    })
+
+    if (chunkFailed) return
+
+    // Add spacing between chunks in the stitched output.
+    if (i < chunks.length - 1) {
+      onToken('\n\n')
+    }
+  }
+
+  onDone()
+}
+
+/**
+ * Map-reduce summarization for large documents: summarizes each chunk
+ * independently, then summarizes the chunk summaries into a final summary.
+ *
+ * This is the standard technique for summarizing documents that exceed the
+ * model's context window. The first pass (map) captures key points per chunk;
+ * the second pass (reduce) synthesizes them into a coherent summary.
+ */
+async function runMapReduce(
+  engine: ReturnType<typeof getAIEngine>,
+  system: string,
+  documentText: string,
+  maxTokens: number,
+  temperature: number,
+  stop: string[] | undefined,
+  responsePrefix: string | undefined,
+  onToken: (token: string) => void,
+  onDone: () => void,
+  onError: (err: string) => void,
+  onProgress?: (phase: 'map' | 'reduce', current: number, total: number) => void,
+): Promise<void> {
+  const chunks = chunkDocument(documentText, 6000)
+
+  // Phase 1 (map): summarize each chunk into bullet points.
+  const chunkSummaries: string[] = []
+  for (let i = 0; i < chunks.length; i++) {
+    const chunk = chunks[i]
+    onProgress?.('map', i + 1, chunks.length)
+
+    let summary = ''
+    let failed = false
+    await new Promise<void>((resolve, reject) => {
+      engine.runSkill(
+        {
+          id: 'chunk_summarize',
+          label: 'Summarize',
+          description: '',
+          icon: 'FileText',
+          group: 'extract',
+          scope: 'document',
+          mode: 'insert',
+          maxTokens: 200,
+          temperature,
+          stop,
+          responsePrefix: '- ',
+          buildPrompt: () => ({
+            system: 'Summarize the key points of this section in 2-3 bullet points (- ). Output only the bullets.',
+            user: chunk.text,
+          }),
+        },
+        '',
+        '',
+        {
+          onToken: (token) => {
+            summary += token
+          },
+          onDone: resolve,
+          onError: (err) => reject(new Error(err)),
+        },
+      )
+    }).catch((err) => {
+      onError(err instanceof Error ? err.message : String(err))
+      failed = true
+    })
+
+    if (failed) return
+    chunkSummaries.push(summary.trim())
+  }
+
+  // Phase 2 (reduce): synthesize chunk summaries into a final summary.
+  // If the combined summaries are too large for a single reduce pass, use
+  // hierarchical reduce: reduce in batches, then reduce the batch results.
+  onProgress?.('reduce', 1, 1)
+  let combined = chunkSummaries.join('\n')
+
+  // Budget check: system (~40 tok) + wrapper (~40 tok) + maxTokens + overhead (200)
+  // leaves ~3700 tokens for combined. At 3 chars/token, that's ~11100 chars.
+  const maxCombinedChars = (4096 - 120 - 80 - 80 - 80 - maxTokens) * 3
+  if (combined.length > maxCombinedChars) {
+    // Hierarchical reduce: batch summaries, reduce each batch, then combine.
+    const batchSize = Math.max(1, Math.floor(chunkSummaries.length / Math.ceil(combined.length / maxCombinedChars)))
+    const batchResults: string[] = []
+    for (let b = 0; b < chunkSummaries.length; b += batchSize) {
+      const batch = chunkSummaries.slice(b, b + batchSize).join('\n')
+      let batchResult = ''
+      let batchFailed = false
+      await new Promise<void>((resolve, reject) => {
+        engine.runSkill(
+          {
+            id: 'batch_reduce',
+            label: 'Summarize',
+            description: '',
+            icon: 'FileText',
+            group: 'extract',
+            scope: 'document',
+            mode: 'insert',
+            maxTokens: 200,
+            temperature,
+            stop,
+            responsePrefix: '- ',
+            buildPrompt: () => ({
+              system: 'Combine these key points into a concise summary. Keep the most important points. Output only bullet points (- ).',
+              user: batch,
+            }),
+          },
+          '',
+          '',
+          {
+            onToken: (token) => {
+              batchResult += token
+            },
+            onDone: resolve,
+            onError: (err) => reject(new Error(err)),
+          },
+        )
+      }).catch((err) => {
+        onError(err instanceof Error ? err.message : String(err))
+        batchFailed = true
+      })
+      if (batchFailed) return
+      batchResults.push(batchResult.trim())
+    }
+    combined = batchResults.join('\n')
+  }
+
+  // Final truncate as a safety net.
+  combined = truncateContext(combined, maxCombinedChars)
+
+  await new Promise<void>((resolve, reject) => {
+    engine.runSkill(
+      {
+        id: 'reduce_summarize',
+        label: 'Summarize',
+        description: '',
+        icon: 'FileText',
+        group: 'extract',
+        scope: 'document',
+        mode: 'insert',
+        maxTokens,
+        temperature,
+        stop,
+        responsePrefix,
+        buildPrompt: () => ({
+          system,
+          user: `These are key points from different sections of a document. ` +
+            `Synthesize them into a coherent summary.\n\n${combined}`,
+        }),
+      },
+      '',
+      '',
+      {
+        onToken: (token) => onToken(token),
+        onDone: resolve,
+        onError: (err) => reject(new Error(err)),
+      },
+    )
+  }).catch((err) => {
+    onError(err instanceof Error ? err.message : String(err))
+    return
+  })
+
+  onDone()
+}
+
 export interface AIPanelProps {
   editor: Editor | null
   open: boolean
@@ -257,7 +635,7 @@ export interface AIPanelProps {
 }
 
 export function AIPanel({ editor, open, onClose }: AIPanelProps) {
-  const [activeWorkflow, setActiveWorkflow] = useState<AIWorkflowDef | null>(null)
+  const [activeAction, setActiveAction] = useState<AIActionDef | null>(null)
   const [topic, setTopic] = useState('')
   const [keywords, setKeywords] = useState('')
   const [output, setOutput] = useState('')
@@ -266,7 +644,7 @@ export function AIPanel({ editor, open, onClose }: AIPanelProps) {
   const outputRef = useRef<HTMLDivElement>(null)
 
   const handleRun = useCallback(
-    async (workflow: AIWorkflowDef) => {
+    async (action: AIActionDef) => {
       if (!editor) return
       const engine = getAIEngine()
       if (!engine.isLoaded()) {
@@ -287,52 +665,186 @@ export function AIPanel({ editor, open, onClose }: AIPanelProps) {
       }
       setOutput('')
 
-      const selection = workflow.needsSelection
+      const topicText = topic.trim()
+      const hasSelection = editor.state.selection.from !== editor.state.selection.to
+      const selection = hasSelection
         ? editor.state.doc.textBetween(editor.state.selection.from, editor.state.selection.to, '\n')
         : ''
-      // For whole-document workflows, pass the full text (capped to avoid
-      // overflowing the model's context window). For other workflows, pass
-      // a short preview as context.
-      // For improve_document, pass markdown so the AI can see and preserve
-      // existing structure (headings, lists). For format_document, pass plain
-      // text since the goal is to reformat from scratch.
-      const fullText = workflow.needsFullDocument
-        ? workflow.id === 'improve_document'
-          ? (editor.storage.markdown?.getMarkdown?.() ?? editor.getText()).slice(0, 6000)
-          : editor.getText().slice(0, 6000)
-        : editor.getText().slice(0, 500)
-      const context = fullText
-      const topicText = topic.trim()
 
-      if (workflow.needsTopic && !topicText) {
+      // Determine the input to buildPrompt based on scope.
+      // For selection scope: input = selection text.
+      // For topic scope: input = topic text.
+      // For document scope: input = '' (context is the document).
+      const input = action.scope === 'selection' ? selection : action.scope === 'topic' ? topicText : ''
+
+      // Build the system prompt first to calculate the context budget.
+      // We also need the user-prompt wrapper (the part of the user prompt that
+      // is NOT the variable context) to account for its token overhead.
+      const { system: promptSystem, user: promptUserEmpty } = action.buildPrompt(input, '', keywords)
+      const maxContextChars = budgetForContext(promptSystem, action.maxTokens, promptUserEmpty)
+
+      // Determine the raw document text to use as context.
+      // - Outline-context actions (suggest_title, write_intro, write_conclusion):
+      //   use a compact outline + first-sentence-per-section. Scales to any size.
+      // - Full-document actions (improve/format/summarize_document): use the
+      //   full text. For large docs, chunked/map-reduce strategies handle it.
+      // - Selection actions: no document context needed in the panel.
+      let rawText: string
+      if (action.useOutlineContext) {
+        const fullDoc = editor.getText()
+        rawText = extractOutlineContext(fullDoc)
+      } else if (action.needsFullDocument) {
+        rawText = action.id === 'improve_document'
+          ? editor.storage.markdown?.getMarkdown?.() ?? editor.getText()
+          : editor.getText()
+      } else if (action.scope === 'selection') {
+        rawText = '' // selection actions don't need document context in the panel
+      } else {
+        rawText = editor.getText()
+      }
+
+      // For full-document transform actions, check if the doc needs chunking.
+      // If it fits in the context budget, use the single-pass path. If not,
+      // use chunked transform (improve/format) or map-reduce (summarize).
+      const needsChunking =
+        action.needsFullDocument &&
+        !action.useOutlineContext &&
+        rawText.length > maxContextChars
+
+      // For the chunked/map-reduce paths, we pass the full untruncated text
+      // to the strategy function. For the single-pass path, truncate.
+      const context = needsChunking ? rawText : truncateContext(rawText, maxContextChars)
+
+      if (action.needsTopic && !topicText) {
         setStatus('error')
         setOutput('Please enter a topic above.')
         return
       }
 
-      if (workflow.needsFullDocument && !context.trim()) {
+      if (action.scope === 'selection' && !selection.trim()) {
+        setStatus('error')
+        setOutput('Select text in the document first, then run this action.')
+        return
+      }
+
+      if (action.needsFullDocument && !context.trim()) {
         setStatus('error')
         setOutput('The document is empty. Add some content first.')
         return
       }
 
-      setOutput('')
+      // Adaptively reduce maxTokens for document-scoped single-pass actions so
+      // the full context fits. The continuation mechanism handles the rest.
+      // Chunked/map-reduce paths manage their own token budgets per chunk.
+      let effectiveMaxTokens = action.maxTokens
+      if (action.scope === 'document' && !needsChunking && context) {
+        effectiveMaxTokens = adaptiveMaxOutput(
+          promptSystem,
+          context,
+          action.maxTokens,
+          promptUserEmpty,
+        )
+      }
+
       setContinuationRound(0)
       setStatus('streaming')
 
-      const { system, user } = workflow.buildPrompt(topicText, selection, context, keywords)
+      const { system, user } = action.buildPrompt(input, needsChunking ? '' : context, keywords)
 
-      // For whole-document workflows, use continuation support to overcome
-      // the max_tokens limit — the model generates in chunks and we stitch
-      // them together. For other workflows, a single call suffices.
-      if (workflow.needsFullDocument) {
+      // Dispatch strategy:
+      //   generate_document       -> sectioned generation (outline -> per-section)
+      //   summarize_document      -> map-reduce (if large) or single-pass
+      //   improve/format_document -> chunked transform (if large) or continuation
+      //   outline-context actions -> single-pass (context is compact)
+      //   everything else         -> single run
+      if (action.id === 'generate_document') {
+        await runSectionedGeneration(
+          engine,
+          topicText,
+          keywords,
+          action.maxTokens,
+          action.temperature,
+          action.stop,
+          (token) => {
+            setOutput((prev) => prev + token)
+            if (outputRef.current) {
+              outputRef.current.scrollTop = outputRef.current.scrollHeight
+            }
+          },
+          () => {
+            setStatus('done')
+            setContinuationRound(0)
+          },
+          (err) => {
+            setStatus('error')
+            setOutput(err)
+            setContinuationRound(0)
+          },
+          (section, _total, _heading) => {
+            setContinuationRound(section)
+          },
+        )
+      } else if (action.id === 'summarize_document' && needsChunking) {
+        await runMapReduce(
+          engine,
+          system,
+          context,
+          action.maxTokens,
+          action.temperature,
+          action.stop,
+          action.responsePrefix,
+          (token) => {
+            setOutput((prev) => prev + token)
+            if (outputRef.current) {
+              outputRef.current.scrollTop = outputRef.current.scrollHeight
+            }
+          },
+          () => {
+            setStatus('done')
+            setContinuationRound(0)
+          },
+          (err) => {
+            setStatus('error')
+            setOutput(err)
+            setContinuationRound(0)
+          },
+          (phase, current, total) => {
+            setContinuationRound(phase === 'map' ? current : total + 1)
+          },
+        )
+      } else if ((action.id === 'improve_document' || action.id === 'format_document') && needsChunking) {
+        await runChunkedTransform(
+          engine,
+          system,
+          context,
+          effectiveMaxTokens,
+          action.temperature,
+          action.stop,
+          (token) => {
+            setOutput((prev) => prev + token)
+            if (outputRef.current) {
+              outputRef.current.scrollTop = outputRef.current.scrollHeight
+            }
+          },
+          () => {
+            setStatus('done')
+            setContinuationRound(0)
+          },
+          (err) => {
+            setStatus('error')
+            setOutput(err)
+            setContinuationRound(0)
+          },
+          (chunk) => setContinuationRound(chunk),
+        )
+      } else if (action.scope === 'document') {
         await runWithContinuation(
           engine,
           system,
           user,
-          workflow.maxTokens,
-          workflow.temperature,
-          workflow.stop,
+          effectiveMaxTokens,
+          action.temperature,
+          action.stop,
           (token) => {
             setOutput((prev) => prev + token)
             if (outputRef.current) {
@@ -349,21 +861,25 @@ export function AIPanel({ editor, open, onClose }: AIPanelProps) {
             setContinuationRound(0)
           },
           (iteration) => setContinuationRound(iteration),
+          5,
+          action.responsePrefix,
         )
       } else {
         await engine.runSkill(
           {
-            id: workflow.id,
-            label: workflow.label,
-            description: workflow.description,
-            icon: workflow.icon,
-            maxTokens: workflow.maxTokens,
-            temperature: workflow.temperature,
-            stop: workflow.stop,
-            needsSelection: workflow.needsSelection,
+            id: action.id,
+            label: action.label,
+            description: action.description,
+            icon: action.icon,
+            group: action.group,
+            scope: action.scope,
             mode: 'insert',
+            maxTokens: action.maxTokens,
+            temperature: action.temperature,
+            stop: action.stop,
+            responsePrefix: action.responsePrefix,
             buildPrompt: () => ({ system, user }),
-          } as never,
+          },
           selection,
           context,
           {
@@ -418,24 +934,34 @@ export function AIPanel({ editor, open, onClose }: AIPanelProps) {
       </div>
 
       <div className="flex-1 overflow-y-auto p-3">
-        {!activeWorkflow ? (
-          <div className="space-y-1">
-            <p className="text-muted mb-2 text-xs">Choose a workflow:</p>
-            {WORKFLOW_LIST.map((wf) => {
-              const Icon = WORKFLOW_ICONS[wf.icon] ?? Sparkles
+        {!activeAction ? (
+          <div className="space-y-3">
+            {GROUP_ORDER.map((group: AIActionGroup) => {
+              const actions = ACTIONS_BY_GROUP[group]
+              if (actions.length === 0) return null
               return (
-                <button
-                  key={wf.id}
-                  type="button"
-                  onClick={() => setActiveWorkflow(wf)}
-                  className="hover:bg-surface-2 flex w-full items-start gap-2 rounded-lg p-2 text-left transition-colors"
-                >
-                  <Icon className="text-brand mt-0.5 h-4 w-4 shrink-0" />
-                  <div className="flex flex-col">
-                    <span className="text-fg text-sm font-medium">{wf.label}</span>
-                    <span className="text-muted text-xs">{wf.description}</span>
-                  </div>
-                </button>
+                <div key={group} className="space-y-1">
+                  <p className="text-muted px-1 text-xs font-semibold uppercase tracking-wide">
+                    {GROUP_LABELS[group]}
+                  </p>
+                  {actions.map((action) => {
+                    const Icon = ACTION_ICONS[action.icon] ?? DEFAULT_ACTION_ICON
+                    return (
+                      <button
+                        key={action.id}
+                        type="button"
+                        onClick={() => setActiveAction(action)}
+                        className="hover:bg-surface-2 flex w-full items-start gap-2 rounded-lg p-2 text-left transition-colors"
+                      >
+                        <Icon className="text-brand mt-0.5 h-4 w-4 shrink-0" />
+                        <div className="flex flex-col">
+                          <span className="text-fg text-sm font-medium">{action.label}</span>
+                          <span className="text-muted text-xs">{action.description}</span>
+                        </div>
+                      </button>
+                    )
+                  })}
+                </div>
               )
             })}
           </div>
@@ -444,27 +970,27 @@ export function AIPanel({ editor, open, onClose }: AIPanelProps) {
             <button
               type="button"
               onClick={() => {
-                setActiveWorkflow(null)
+                setActiveAction(null)
                 setOutput('')
                 setStatus('idle')
                 setKeywords('')
               }}
               className="text-muted hover:text-fg text-xs"
             >
-              ← Back to workflows
+              &larr; Back to actions
             </button>
 
             <div>
               <label className="text-fg mb-1 block text-xs font-medium">
-                {activeWorkflow.needsTopic
-                  ? (activeWorkflow.topicLabel ?? 'Topic / Brief')
-                  : activeWorkflow.needsSelection
+                {activeAction.needsTopic
+                  ? (activeAction.topicLabel ?? 'Topic / Brief')
+                  : activeAction.scope === 'selection'
                     ? 'Selected text will be used'
-                    : activeWorkflow.needsFullDocument
-                      ? 'Entire document will be processed — use "Replace document" to apply'
+                    : activeAction.needsFullDocument
+                      ? 'Entire document will be processed - use "Replace document" to apply'
                       : 'Document context will be used'}
               </label>
-              {activeWorkflow.needsTopic && (
+              {activeAction.needsTopic && (
                 <textarea
                   value={topic}
                   onChange={(e) => setTopic(e.target.value)}
@@ -477,14 +1003,14 @@ export function AIPanel({ editor, open, onClose }: AIPanelProps) {
                   onKeyDown={(e) => {
                     if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
                       e.preventDefault()
-                      handleRun(activeWorkflow)
+                      handleRun(activeAction)
                     }
                   }}
                 />
               )}
             </div>
 
-            {activeWorkflow.needsTopic && activeWorkflow.supportsKeywords && (
+            {activeAction.needsTopic && activeAction.supportsKeywords && (
               <div>
                 <label className="text-fg mb-1 block text-xs font-medium">
                   Keywords <span className="text-muted">(optional)</span>
@@ -504,7 +1030,7 @@ export function AIPanel({ editor, open, onClose }: AIPanelProps) {
 
             <button
               type="button"
-              onClick={() => handleRun(activeWorkflow)}
+              onClick={() => handleRun(activeAction)}
               disabled={status === 'streaming'}
               className={cn(
                 'flex w-full items-center justify-center gap-1.5 rounded-lg px-3 py-2 text-sm font-medium transition-colors',
@@ -539,7 +1065,7 @@ export function AIPanel({ editor, open, onClose }: AIPanelProps) {
 
                 {status === 'done' && output && (
                   <div className="flex gap-2">
-                    {activeWorkflow.needsFullDocument ? (
+                    {activeAction.needsFullDocument ? (
                       <>
                         <button
                           type="button"

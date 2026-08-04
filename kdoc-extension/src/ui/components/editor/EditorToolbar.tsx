@@ -12,6 +12,7 @@ import {
   ListChecks,
   ListOrdered,
   Minus,
+  PanelRight,
   Quote,
   Redo,
   Strikethrough,
@@ -103,9 +104,11 @@ function ToolbarGroup({buttons, editor}: {buttons: ToolbarButton[]; editor: Edit
 
 export interface EditorToolbarProps {
   editor: Editor | null
+  aiPanelOpen?: boolean
+  onToggleAIPanel?: () => void
 }
 
-export function EditorToolbar({editor}: EditorToolbarProps) {
+export function EditorToolbar({editor, aiPanelOpen, onToggleAIPanel}: EditorToolbarProps) {
   const handleMouseDown = useCallback((e: MouseEvent) => {
     e.preventDefault()
   }, [])
@@ -126,6 +129,30 @@ export function EditorToolbar({editor}: EditorToolbarProps) {
       <ToolbarGroup buttons={LIST_BUTTONS} editor={editor} />
       <Divider />
       <ToolbarGroup buttons={INSERT_BUTTONS} editor={editor} />
+      {onToggleAIPanel && (
+        <>
+          <div className="ml-auto" />
+          <Divider />
+          <button
+            type="button"
+            title="Writing Tools (Cmd+K)"
+            aria-label="Writing Tools"
+            aria-pressed={aiPanelOpen ?? false}
+            onMouseDown={(e: MouseEvent) => {
+              e.preventDefault()
+              onToggleAIPanel()
+            }}
+            className={cn(
+              'inline-flex h-7 items-center gap-1.5 rounded px-2 transition-colors',
+              'hover:bg-surface-2 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring',
+              aiPanelOpen ? 'bg-brand/10 text-brand' : 'text-muted hover:text-fg',
+            )}
+          >
+            <PanelRight className="h-3.5 w-3.5" aria-hidden="true" />
+            <span className="text-xs font-medium">Writing</span>
+          </button>
+        </>
+      )}
     </div>
   )
 }

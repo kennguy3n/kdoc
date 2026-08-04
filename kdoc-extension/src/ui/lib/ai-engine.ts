@@ -1,4 +1,4 @@
-import type {AISkillDef} from './ai-skills'
+import type {AIActionDef} from './ai-actions'
 
 export type ModelLoadProgress = (progress: number) => void
 
@@ -6,6 +6,8 @@ export interface AIEngineCallbacks {
   onToken: (token: string) => void
   onDone: () => void
   onError: (error: string) => void
+  /** Called if the backend signals that generation was cut off by max_tokens. */
+  onCutOff?: () => void
 }
 
 export interface ModelInfo {
@@ -127,7 +129,7 @@ export class AIEngine {
   }
 
   async runSkill(
-    skill: AISkillDef,
+    skill: AIActionDef,
     selection: string,
     context: string | undefined,
     callbacks: AIEngineCallbacks,
@@ -137,7 +139,11 @@ export class AIEngine {
       return
     }
 
-    const {system, user} = skill.buildPrompt(selection, context)
+    // For selection-scope actions, input is the selection text.
+    // For topic-scope actions, input is the context (which carries the topic).
+    // For document-scope actions, input is empty (context is the document).
+    const input = skill.scope === 'selection' ? selection : skill.scope === 'topic' ? (context ?? '') : ''
+    const {system, user} = skill.buildPrompt(input, context)
 
     try {
       const resp = await fetch(`${BACKEND_URL}/api/chat`, {
@@ -149,6 +155,7 @@ export class AIEngine {
           max_tokens: skill.maxTokens,
           temperature: skill.temperature,
           stop: skill.stop,
+          response_prefix: skill.responsePrefix,
         }),
       })
 
@@ -184,8 +191,20 @@ export class AIEngine {
             }
           }
           if (line.startsWith('data: ')) {
-            const token = line.slice(6)
-            if (token) callbacks.onToken(token)
+            const raw = line.slice(6)
+            if (!raw) continue
+            try {
+              const token = JSON.parse(raw) as string
+              if (!token) continue
+              // Detect backend cut-off signal (sent when stop_type == "limit")
+              if (token.includes('[CUT_OFF]')) {
+                callbacks.onCutOff?.()
+                continue
+              }
+              callbacks.onToken(token)
+            } catch {
+              callbacks.onToken(raw)
+            }
           }
         }
       }

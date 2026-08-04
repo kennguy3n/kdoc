@@ -18,14 +18,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 futures-util = "0.3"
 tokio-stream = "0.1"
-
-# GGUF support via candle on Apple platforms
-[target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
-candle-core = { version = "0.9", features = ["metal"] }
-candle-nn = { version = "0.9", features = ["metal"] }
-candle-transformers = "0.9"
-hf-hub = { version = "0.4", features = ["tokio"] }
-tokenizers = "0.21"
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
 
 [features]
 default = []

@@ -16,7 +16,6 @@ use tokio_stream::wrappers::ReceiverStream;
 use tower_http::cors::CorsLayer;
 
 mod model_loader;
-mod qwen35_gguf;
 
 use model_loader::ModelLoader;
 
@@ -38,6 +37,7 @@ struct ChatRequest {
     max_tokens: Option<u32>,
     temperature: Option<f32>,
     stop: Option<Vec<String>>,
+    response_prefix: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -199,7 +199,7 @@ async fn chat(
     Sse<impl futures_util::Stream<Item = Result<Event, std::convert::Infallible>>>,
     (StatusCode, Json<ErrorResponse>),
 > {
-    let mut loader = state.loader.write().await;
+    let loader = state.loader.read().await;
     if !loader.is_loaded() {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -212,12 +212,16 @@ async fn chat(
     let max_tokens = req.max_tokens.unwrap_or(512);
     let temperature = req.temperature.unwrap_or(0.7);
     let stop = req.stop.unwrap_or_default();
+    let response_prefix = req.response_prefix.unwrap_or_default();
 
-    let stream = loader.chat_stream(&req.system, &req.user, max_tokens, temperature, stop);
+    let stream = loader.chat_stream(&req.system, &req.user, max_tokens, temperature, stop, response_prefix);
 
     let sse_stream = ReceiverStream::new(stream).map(|result| {
         match result {
-            Ok(token) => Ok(Event::default().data(token)),
+            Ok(token) => {
+                let encoded = serde_json::to_string(&token).unwrap_or_else(|_| "\"\"".to_string());
+                Ok(Event::default().data(encoded))
+            }
             Err(e) => Ok(Event::default()
                 .event("error")
                 .data(e.to_string())),
@@ -233,7 +237,7 @@ async fn chat(
 
 async fn unload_model(State(state): State<AppState>) -> impl IntoResponse {
     let mut loader = state.loader.write().await;
-    loader.unload();
+    loader.unload().await;
     Json(serde_json::json!({"status": "unloaded"}))
 }
 
