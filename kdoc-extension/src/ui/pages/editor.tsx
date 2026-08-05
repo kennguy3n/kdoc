@@ -243,13 +243,15 @@ export function EditorPage() {
     }
   }, [exportMenuOpen])
 
+  const loadingRef = useRef(false)
   const loadModel = useCallback(async () => {
     const engine = getAIEngine()
     if (engine.isLoaded()) {
       setModelStatus('loaded')
       return
     }
-    if (modelStatus === 'loading') return
+    if (loadingRef.current) return
+    loadingRef.current = true
     setModelStatus('loading')
     try {
       await engine.autoLoadModel()
@@ -257,8 +259,10 @@ export function EditorPage() {
     } catch (err) {
       console.error('Model load failed:', err)
       setModelStatus('error')
+    } finally {
+      loadingRef.current = false
     }
-  }, [modelStatus])
+  }, [])
 
   // Auto-load model on mount
   useEffect(() => {

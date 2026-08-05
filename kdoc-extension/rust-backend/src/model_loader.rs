@@ -15,6 +15,7 @@ pub struct ModelLoader {
     child: Option<Child>,
     model_name: Option<String>,
     model_format: Option<String>,
+    ctx_size: u32,
 }
 
 fn env_or(key: &str, default: &str) -> String {
@@ -27,6 +28,7 @@ impl ModelLoader {
             child: None,
             model_name: None,
             model_format: None,
+            ctx_size: 4096,
         }
     }
 
@@ -44,6 +46,10 @@ impl ModelLoader {
 
     pub fn backend_name(&self) -> &'static str {
         "llama.cpp"
+    }
+
+    pub fn ctx_size(&self) -> u32 {
+        self.ctx_size
     }
 
     pub async fn load(&mut self, path: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -65,6 +71,8 @@ impl ModelLoader {
         let ctx_size = env_or("KDOC_CTX_SIZE", "4096");
         let ngl = env_or("KDOC_NGL", "99");
         let threads = env_or("KDOC_THREADS", "4");
+
+        let ctx_size_val: u32 = ctx_size.parse().unwrap_or(4096);
 
         let mut child = Command::new(&server_bin)
             .arg("-m").arg(path)
@@ -122,8 +130,9 @@ impl ModelLoader {
                 .unwrap_or_else(|| path.to_string()),
         );
         self.model_format = Some("gguf".to_string());
+        self.ctx_size = ctx_size_val;
 
-        tracing::info!("llama-server is ready on port {}", INTERNAL_PORT);
+        tracing::info!("llama-server is ready on port {} (ctx_size={})", INTERNAL_PORT, self.ctx_size);
         Ok(())
     }
 
@@ -154,12 +163,13 @@ impl ModelLoader {
         }
 
         let port = INTERNAL_PORT;
+        let ctx_size = self.ctx_size;
         let system = system.to_string();
         let user = user.to_string();
         let tx_err = tx.clone();
 
         tokio::spawn(async move {
-            if let Err(e) = proxy_chat_stream(port, &system, &user, max_tokens, temperature, stop, &response_prefix, tx).await {
+            if let Err(e) = proxy_chat_stream(port, ctx_size, &system, &user, max_tokens, temperature, stop, &response_prefix, tx).await {
                 tracing::error!("Chat stream error: {}", e);
                 let _ = tx_err.send(Err(e)).await;
             }
@@ -189,6 +199,7 @@ async fn wait_for_ready(port: u16) -> Result<(), Box<dyn std::error::Error + Sen
 
 async fn proxy_chat_stream(
     port: u16,
+    ctx_size: u32,
     system: &str,
     user: &str,
     max_tokens: u32,
@@ -197,6 +208,77 @@ async fn proxy_chat_stream(
     response_prefix: &str,
     tx: mpsc::Sender<Result<String, Box<dyn std::error::Error + Send + Sync>>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Chat template overhead: roughly 50-80 tokens for the im_start/im_end markers
+    // and think tags. Use 150 as a safety margin to account for tokenizer differences.
+    const TEMPLATE_OVERHEAD: u32 = 150;
+
+    let system_tokens = estimate_tokens(system);
+    let budget = ctx_size
+        .saturating_sub(system_tokens)
+        .saturating_sub(TEMPLATE_OVERHEAD)
+        .saturating_sub(max_tokens);
+
+    let user_tokens = estimate_tokens(user);
+
+    if user_tokens <= budget {
+        // Single call - fits in context
+        let alive = single_completion(
+            port, system, user, max_tokens, temperature, &stop, response_prefix, true, &tx,
+        ).await?;
+        let _ = alive;
+        return Ok(());
+    }
+
+    // Chunked processing: split user text and process each chunk sequentially
+    tracing::info!(
+        "Input too large for context (user~{} tokens, budget~{} tokens, ctx={}). Chunking enabled.",
+        user_tokens, budget, ctx_size
+    );
+
+    let chunks = chunk_text(user, budget);
+    tracing::info!("Split input into {} chunks", chunks.len());
+
+    // Emit response prefix once before the first chunk
+    if !response_prefix.is_empty() {
+        if tx.send(Ok(response_prefix.to_string())).await.is_err() {
+            return Ok(()); // receiver dropped
+        }
+    }
+
+    for (i, chunk) in chunks.iter().enumerate() {
+        let is_first = i == 0;
+        // Don't emit response_prefix again (already emitted above).
+        // Include it in the prompt only for the first chunk to anchor output format.
+        let prefix_in_prompt = if is_first { response_prefix } else { "" };
+        let alive = single_completion(
+            port, system, chunk, max_tokens, temperature, &stop, prefix_in_prompt, false, &tx,
+        ).await?;
+
+        if !alive {
+            break; // receiver dropped
+        }
+    }
+
+    Ok(())
+}
+
+/// Make a single llama-server completion call and stream the response through
+/// the think-tag state machine. Returns `true` if the receiver is still alive,
+/// `false` if it was dropped (client disconnected).
+///
+/// When `emit_response_prefix` is true, the response_prefix is sent as the
+/// first token before making the request.
+async fn single_completion(
+    port: u16,
+    system: &str,
+    user: &str,
+    max_tokens: u32,
+    temperature: f32,
+    stop: &[String],
+    response_prefix: &str,
+    emit_response_prefix: bool,
+    tx: &mpsc::Sender<Result<String, Box<dyn std::error::Error + Send + Sync>>>,
+) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
     let prompt = format!(
         "<|im_start|>system\n{system}<|im_end|>\n<|im_start|>user\n{user}<|im_end|>\n<|im_start|>assistant\n{THINK_OPEN}\n\n{THINK_CLOSE}\n\n{response_prefix}",
         system = system,
@@ -204,10 +286,9 @@ async fn proxy_chat_stream(
         response_prefix = response_prefix,
     );
 
-    // Emit the response prefix as the first token so the client sees it.
-    if !response_prefix.is_empty() {
+    if emit_response_prefix && !response_prefix.is_empty() {
         if tx.send(Ok(response_prefix.to_string())).await.is_err() {
-            return Ok(()); // receiver dropped
+            return Ok(false); // receiver dropped
         }
     }
 
@@ -236,18 +317,21 @@ async fn proxy_chat_stream(
         return Err(format!("llama-server returned {}: {}", status, text).into());
     }
 
+    process_completion_stream(resp, stop, tx).await
+}
+
+/// Process a llama-server streaming response through the think-tag state machine.
+/// Returns `true` if the receiver is still alive, `false` if it was dropped.
+async fn process_completion_stream(
+    resp: reqwest::Response,
+    stop: &[String],
+    tx: &mpsc::Sender<Result<String, Box<dyn std::error::Error + Send + Sync>>>,
+) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
     let mut stream = resp.bytes_stream();
     let mut buf = String::new();
     let mut generated_text = String::new();
 
-    // Think-tag state machine: track nesting depth instead of string matching.
-    // The prompt pre-fills an empty think block, so the model's output starts
-    // after THINK_CLOSE. If the model generates another think block mid-output,
-    // we correctly skip it and resume after it closes.
     let mut think_depth: i32 = 0;
-    // Buffer for partial think-tag prefixes split across tokens.
-    // If a token ends with a prefix of THINK_OPEN/THINK_CLOSE, we hold it back
-    // and prepend it to the next token.
     let mut pending: String = String::new();
 
     while let Some(chunk_result) = stream.next().await {
@@ -258,7 +342,6 @@ async fn proxy_chat_stream(
 
         buf.push_str(&String::from_utf8_lossy(&chunk));
 
-        // Process complete lines
         while let Some(nl_pos) = buf.find('\n') {
             let line = buf[..nl_pos].trim().to_string();
             buf = buf[nl_pos + 1..].to_string();
@@ -269,7 +352,7 @@ async fn proxy_chat_stream(
 
             let data = &line[6..];
             if data == "[DONE]" {
-                return Ok(());
+                return Ok(true);
             }
 
             let parsed: serde_json::Value = match serde_json::from_str(data) {
@@ -277,12 +360,8 @@ async fn proxy_chat_stream(
                 Err(_) => continue,
             };
 
-            // Check stop_type from the final chunk (llama-server sends this
-            // in the last data event before [DONE]).
-            // "limit" means max_tokens was hit; "stop" means a stop string matched.
             if let Some(stop_type) = parsed.get("stop_type").and_then(|v| v.as_str()) {
                 if stop_type == "limit" {
-                    // Signal to the client that generation was cut off by max_tokens.
                     let _ = tx.send(Ok("\u{0000}[CUT_OFF]\u{0000}".to_string())).await;
                 }
             }
@@ -296,7 +375,6 @@ async fn proxy_chat_stream(
                 continue;
             }
 
-            // Prepend any held-back partial tag from the previous token.
             let full_token = if pending.is_empty() {
                 token.to_string()
             } else {
@@ -307,37 +385,26 @@ async fn proxy_chat_stream(
 
             generated_text.push_str(&full_token);
 
-            // Think-tag state machine: track nesting depth instead of string matching.
-            // The prompt pre-fills an empty think block, so the model's output starts
-            // after THINK_CLOSE. If the model generates another think block mid-output,
-            // we correctly skip it and resume after it closes.
-            //
-            // Tags may be split across tokens. If the remaining text ends with a
-            // prefix of THINK_OPEN or THINK_CLOSE, hold it back for the next token.
             let mut remaining = full_token.as_str();
             let mut clean_parts: String = String::new();
 
             loop {
                 if think_depth > 0 {
-                    // Inside a think block: look for THINK_CLOSE
                     if let Some(pos) = remaining.find(THINK_CLOSE) {
                         think_depth -= 1;
                         remaining = &remaining[pos + THINK_CLOSE.len()..];
                     } else {
-                        // Check if remaining ends with a partial THINK_CLOSE prefix.
                         if let Some(partial_len) = partial_tag_prefix_len(remaining, THINK_CLOSE) {
                             pending = remaining[remaining.len() - partial_len..].to_string();
                         }
                         break;
                     }
                 } else {
-                    // Outside think block: look for THINK_OPEN
                     if let Some(pos) = remaining.find(THINK_OPEN) {
                         clean_parts.push_str(&remaining[..pos]);
                         think_depth += 1;
                         remaining = &remaining[pos + THINK_OPEN.len()..];
                     } else {
-                        // Check if remaining ends with a partial THINK_OPEN prefix.
                         if let Some(partial_len) = partial_tag_prefix_len(remaining, THINK_OPEN) {
                             clean_parts.push_str(&remaining[..remaining.len() - partial_len]);
                             pending = remaining[remaining.len() - partial_len..].to_string();
@@ -351,9 +418,8 @@ async fn proxy_chat_stream(
 
             let clean_token = clean_parts;
 
-            // Check stop strings
             let mut hit_stop = false;
-            for s in &stop {
+            for s in stop {
                 if generated_text.contains(s) {
                     hit_stop = true;
                     break;
@@ -362,7 +428,7 @@ async fn proxy_chat_stream(
 
             if !hit_stop && !clean_token.is_empty() {
                 if tx.send(Ok(clean_token)).await.is_err() {
-                    break; // receiver dropped
+                    return Ok(false); // receiver dropped
                 }
             }
 
@@ -372,7 +438,7 @@ async fn proxy_chat_stream(
         }
     }
 
-    Ok(())
+    Ok(true)
 }
 
 /// Check if `text` ends with a prefix of `tag`. If so, return the length of
@@ -393,6 +459,96 @@ fn partial_tag_prefix_len(text: &str, tag: &str) -> Option<usize> {
         }
     }
     None
+}
+
+/// Rough token count estimate. Conservative to avoid context overflow.
+/// ~3 chars/token for Latin, ~1.2 chars/token for CJK.
+fn estimate_tokens(text: &str) -> u32 {
+    let chars = text.chars().count() as f32;
+    if chars == 0.0 {
+        return 0;
+    }
+    let bytes = text.len() as f32;
+    let ratio = bytes / chars;
+    let chars_per_token = if ratio > 2.0 { 1.2 } else { 3.0 };
+    (chars / chars_per_token).ceil() as u32
+}
+
+/// Split text into chunks that each fit within `max_tokens` tokens.
+/// Splits at paragraph boundaries (double newline), then line boundaries,
+/// then character boundaries as a last resort.
+fn chunk_text(text: &str, max_tokens: u32) -> Vec<String> {
+    if estimate_tokens(text) <= max_tokens {
+        return vec![text.to_string()];
+    }
+
+    let mut chunks: Vec<String> = Vec::new();
+    let mut current = String::new();
+
+    for para in text.split("\n\n") {
+        let candidate = if current.is_empty() {
+            para.to_string()
+        } else {
+            format!("{}\n\n{}", current, para)
+        };
+
+        if estimate_tokens(&candidate) <= max_tokens {
+            current = candidate;
+        } else {
+            if !current.is_empty() {
+                chunks.push(std::mem::take(&mut current));
+            }
+
+            if estimate_tokens(para) <= max_tokens {
+                current = para.to_string();
+            } else {
+                // Paragraph too big, split by lines
+                for line in para.split('\n') {
+                    let candidate = if current.is_empty() {
+                        line.to_string()
+                    } else {
+                        format!("{}\n{}", current, line)
+                    };
+
+                    if estimate_tokens(&candidate) <= max_tokens {
+                        current = candidate;
+                    } else {
+                        if !current.is_empty() {
+                            chunks.push(std::mem::take(&mut current));
+                        }
+                        if estimate_tokens(line) <= max_tokens {
+                            current = line.to_string();
+                        } else {
+                            // Line too big, hard split at char boundary
+                            let max_chars = (max_tokens as f32 * 3.0) as usize;
+                            let mut start = 0;
+                            while start < line.len() {
+                                let mut end = (start + max_chars).min(line.len());
+                                while end < line.len() && !line.is_char_boundary(end) {
+                                    end -= 1;
+                                }
+                                if !current.is_empty() {
+                                    chunks.push(std::mem::take(&mut current));
+                                }
+                                current = line[start..end].to_string();
+                                start = end;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+
+    if chunks.is_empty() {
+        chunks.push(text.to_string());
+    }
+
+    chunks
 }
 
 fn find_llama_server() -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
