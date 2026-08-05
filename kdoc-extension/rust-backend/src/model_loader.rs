@@ -222,20 +222,29 @@ async fn proxy_chat_stream(
 
     if user_tokens <= budget {
         // Single call - fits in context
-        let alive = single_completion(
+        let _ = single_completion(
             port, system, user, max_tokens, temperature, &stop, response_prefix, true, &tx,
         ).await?;
-        let _ = alive;
         return Ok(());
     }
 
-    // Chunked processing: split user text and process each chunk sequentially
+    // Chunked processing: split user text and process each chunk sequentially.
+    // When chunking, rebalance the context: split available space evenly between
+    // input chunk and output, since the original max_tokens was sized for a
+    // single small selection, not for chunk-sized output.
+    let available = ctx_size
+        .saturating_sub(system_tokens)
+        .saturating_sub(TEMPLATE_OVERHEAD);
+
+    let chunk_budget = available / 2;
+    let effective_max_tokens = available / 2;
+
     tracing::info!(
-        "Input too large for context (user~{} tokens, budget~{} tokens, ctx={}). Chunking enabled.",
-        user_tokens, budget, ctx_size
+        "Input too large for context (user~{} tokens, chunk_budget~{} tokens, max_tokens~{}, ctx={}). Chunking enabled.",
+        user_tokens, chunk_budget, effective_max_tokens, ctx_size
     );
 
-    let chunks = chunk_text(user, budget);
+    let chunks = chunk_text(user, chunk_budget);
     tracing::info!("Split input into {} chunks", chunks.len());
 
     // Emit response prefix once before the first chunk
@@ -245,13 +254,15 @@ async fn proxy_chat_stream(
         }
     }
 
+    // Process each chunk independently. Carry-over context was tried but caused
+    // the model to repeat previous output. Independent chunks work better for
+    // translation and similar tasks since each section is self-contained.
     for (i, chunk) in chunks.iter().enumerate() {
         let is_first = i == 0;
-        // Don't emit response_prefix again (already emitted above).
-        // Include it in the prompt only for the first chunk to anchor output format.
         let prefix_in_prompt = if is_first { response_prefix } else { "" };
-        let alive = single_completion(
-            port, system, chunk, max_tokens, temperature, &stop, prefix_in_prompt, false, &tx,
+
+        let (alive, _clean_output) = single_completion(
+            port, system, chunk, effective_max_tokens, temperature, &stop, prefix_in_prompt, false, &tx,
         ).await?;
 
         if !alive {
@@ -278,7 +289,7 @@ async fn single_completion(
     response_prefix: &str,
     emit_response_prefix: bool,
     tx: &mpsc::Sender<Result<String, Box<dyn std::error::Error + Send + Sync>>>,
-) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<(bool, String), Box<dyn std::error::Error + Send + Sync>> {
     let prompt = format!(
         "<|im_start|>system\n{system}<|im_end|>\n<|im_start|>user\n{user}<|im_end|>\n<|im_start|>assistant\n{THINK_OPEN}\n\n{THINK_CLOSE}\n\n{response_prefix}",
         system = system,
@@ -288,7 +299,7 @@ async fn single_completion(
 
     if emit_response_prefix && !response_prefix.is_empty() {
         if tx.send(Ok(response_prefix.to_string())).await.is_err() {
-            return Ok(false); // receiver dropped
+            return Ok((false, String::new())); // receiver dropped
         }
     }
 
@@ -317,7 +328,8 @@ async fn single_completion(
         return Err(format!("llama-server returned {}: {}", status, text).into());
     }
 
-    process_completion_stream(resp, stop, tx).await
+    let (alive, clean_output) = process_completion_stream(resp, stop, tx).await?;
+    Ok((alive, clean_output))
 }
 
 /// Process a llama-server streaming response through the think-tag state machine.
@@ -326,10 +338,11 @@ async fn process_completion_stream(
     resp: reqwest::Response,
     stop: &[String],
     tx: &mpsc::Sender<Result<String, Box<dyn std::error::Error + Send + Sync>>>,
-) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<(bool, String), Box<dyn std::error::Error + Send + Sync>> {
     let mut stream = resp.bytes_stream();
     let mut buf = String::new();
     let mut generated_text = String::new();
+    let mut clean_output = String::new();
 
     let mut think_depth: i32 = 0;
     let mut pending: String = String::new();
@@ -352,7 +365,7 @@ async fn process_completion_stream(
 
             let data = &line[6..];
             if data == "[DONE]" {
-                return Ok(true);
+                return Ok((true, clean_output));
             }
 
             let parsed: serde_json::Value = match serde_json::from_str(data) {
@@ -427,8 +440,9 @@ async fn process_completion_stream(
             }
 
             if !hit_stop && !clean_token.is_empty() {
+                clean_output.push_str(&clean_token);
                 if tx.send(Ok(clean_token)).await.is_err() {
-                    return Ok(false); // receiver dropped
+                    return Ok((false, clean_output)); // receiver dropped
                 }
             }
 
@@ -438,7 +452,7 @@ async fn process_completion_stream(
         }
     }
 
-    Ok(true)
+    Ok((true, clean_output))
 }
 
 /// Check if `text` ends with a prefix of `tag`. If so, return the length of

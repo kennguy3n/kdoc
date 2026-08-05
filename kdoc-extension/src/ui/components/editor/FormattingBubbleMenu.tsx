@@ -9,7 +9,7 @@ import {
   Underline as UnderlineIcon,
   type LucideIcon,
 } from 'lucide-react'
-import {useCallback, useState, type MouseEvent} from 'react'
+import {useCallback, useEffect, useRef, useState, type MouseEvent} from 'react'
 
 import {cn} from '@/ui/utils'
 import {LinkInputPopover} from './LinkInputPopover'
@@ -41,6 +41,30 @@ export interface FormattingBubbleMenuProps {
 
 export function FormattingBubbleMenu({editor}: FormattingBubbleMenuProps) {
   const [linkInput, setLinkInput] = useState<LinkInputState>({open: false, anchorRect: null})
+  const [kbShow, setKbShow] = useState(false)
+  const pointerUpRef = useRef(false)
+  const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+
+  // Track pointer-based selections so we can distinguish mouse vs keyboard.
+  useEffect(() => {
+    if (!editor) return
+    const handlePointerUp = () => {
+      pointerUpRef.current = true
+      setKbShow(false)
+      if (debounceRef.current) clearTimeout(debounceRef.current)
+    }
+    const handleKeyDown = () => {
+      // Any keyboard activity resets the debounce timer
+      setKbShow(false)
+    }
+    editor.view.dom.addEventListener('pointerup', handlePointerUp)
+    editor.view.dom.addEventListener('keydown', handleKeyDown)
+    return () => {
+      editor.view.dom.removeEventListener('pointerup', handlePointerUp)
+      editor.view.dom.removeEventListener('keydown', handleKeyDown)
+      if (debounceRef.current) clearTimeout(debounceRef.current)
+    }
+  }, [editor])
 
   const handleMouseDown = useCallback(
     (e: MouseEvent, btn: BubbleButtonItem) => {
@@ -72,7 +96,21 @@ export function FormattingBubbleMenu({editor}: FormattingBubbleMenuProps) {
           if (from === to) return false
           if (editor.isActive('codeBlock')) return false
           const text = state.doc.textBetween(from, to, '\n')
-          return text.trim().length > 0
+          if (text.trim().length === 0) return false
+
+          // Mouse selection: show immediately
+          if (pointerUpRef.current) {
+            pointerUpRef.current = false
+            setKbShow(false)
+            if (debounceRef.current) clearTimeout(debounceRef.current)
+            return true
+          }
+
+          // Keyboard selection: only show if the debounce timer has fired
+          // (i.e., selection has been stable for 600ms)
+          if (debounceRef.current) clearTimeout(debounceRef.current)
+          debounceRef.current = setTimeout(() => setKbShow(true), 600)
+          return kbShow
         }}
       >
         <div

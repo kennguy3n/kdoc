@@ -26,11 +26,18 @@ export function AISelectionMenu({editor, onSkillTrigger}: AISelectionMenuProps) 
   const [showCustomInput, setShowCustomInput] = useState(false)
   const selectionRef = useRef<{from: number; to: number} | null>(null)
   const containerRef = useRef<HTMLDivElement>(null)
+  const pointerUpRef = useRef(false)
+  const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null)
 
   const menuItems: MenuItem[] = SELECTION_ACTIONS.map((s) => ({skill: s}))
 
   useEffect(() => {
     if (!editor) return
+
+    const handlePointerUp = () => {
+      pointerUpRef.current = true
+    }
+    editor.view.dom.addEventListener('pointerup', handlePointerUp)
 
     const handleSelectionUpdate = () => {
       const {from, to} = editor.state.selection
@@ -48,23 +55,39 @@ export function AISelectionMenu({editor, onSkillTrigger}: AISelectionMenuProps) 
         return
       }
 
-      const coords = editor.view.coordsAtPos(from)
-      const editorRect = editor.view.dom.getBoundingClientRect()
-      setPosition({
-        top: coords.bottom - editorRect.top + 4,
-        left: coords.left - editorRect.left,
-      })
-      selectionRef.current = {from, to}
-      setSubmenuFor(null)
-      setSelectedIndex(0)
-      setSubIndex(0)
-      setShowCustomInput(false)
-      setVisible(true)
+      const showMenu = () => {
+        const coords = editor.view.coordsAtPos(from)
+        const editorRect = editor.view.dom.getBoundingClientRect()
+        setPosition({
+          top: coords.bottom - editorRect.top + 4,
+          left: coords.left - editorRect.left,
+        })
+        selectionRef.current = {from, to}
+        setSubmenuFor(null)
+        setSelectedIndex(0)
+        setSubIndex(0)
+        setShowCustomInput(false)
+        setVisible(true)
+      }
+
+      // Mouse selection: show immediately
+      if (pointerUpRef.current) {
+        pointerUpRef.current = false
+        if (debounceRef.current) clearTimeout(debounceRef.current)
+        showMenu()
+        return
+      }
+
+      // Keyboard selection: debounce so the menu doesn't appear mid-selection
+      if (debounceRef.current) clearTimeout(debounceRef.current)
+      debounceRef.current = setTimeout(showMenu, 600)
     }
 
     editor.on('selectionUpdate', handleSelectionUpdate)
     return () => {
       editor.off('selectionUpdate', handleSelectionUpdate)
+      editor.view.dom.removeEventListener('pointerup', handlePointerUp)
+      if (debounceRef.current) clearTimeout(debounceRef.current)
     }
   }, [editor])
 
