@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "vite",
     "dev:server": "KCHAT_EXTENSION_BUILD=server vite build --watch",
-    "dev:ai": "cargo run --manifest-path rust-backend/Cargo.toml -- --",
+    "dev:ai": "KDOC_MODEL_DIR=/Users/Ken/workspaces/kocal/kchat-ai-runtime/manifest/packs KCHAT_MLX_SERVER=/Users/Ken/workspaces/kocal/kchat-ai-runtime/swift/kchat-mlx-server/.build/arm64-apple-macosx/release/kchat-mlx-server cargo run --manifest-path rust-backend/Cargo.toml -- --",
     "build:client": "vite build",
     "build:server": "KCHAT_EXTENSION_BUILD=server vite build",
     "build:ai": "cargo build --release --manifest-path rust-backend/Cargo.toml",

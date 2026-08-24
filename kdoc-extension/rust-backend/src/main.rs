@@ -46,6 +46,7 @@ struct StatusResponse {
     model_name: Option<String>,
     model_format: Option<String>,
     backend: String,
+    lora_adapter: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -67,21 +68,29 @@ struct ErrorResponse {
 }
 
 fn detect_format(path: &std::path::Path) -> &'static str {
-    if path.extension().map(|e| e == "gguf").unwrap_or(false) {
-        "gguf"
-    } else {
-        "unknown"
+    // MLX packs are directories containing config.json and/or model.safetensors
+    if path.is_dir() {
+        let has_config = path.join("config.json").exists();
+        let has_safetensors = path.join("model.safetensors").exists()
+            || path.join("model.safetensors.index.json").exists();
+        if has_config || has_safetensors {
+            return "mlx";
+        }
     }
+    "unknown"
 }
 
 fn dir_size_mb(path: &std::path::Path) -> f64 {
     if path.is_file() {
-        return path.metadata().map(|m| m.len() as f64 / 1_048_576.0).unwrap_or(0.0);
+        return std::fs::metadata(path).map(|m| m.len() as f64 / 1_048_576.0).unwrap_or(0.0);
     }
     let mut total = 0u64;
     if let Ok(entries) = std::fs::read_dir(path) {
         for entry in entries.flatten() {
-            if let Ok(meta) = entry.metadata() {
+            // Use std::fs::metadata (follows symlinks) instead of entry.metadata
+            // (which does NOT follow symlinks). MLX packs often contain symlinks
+            // to the actual model files — without this, size shows as 0.0 MB.
+            if let Ok(meta) = std::fs::metadata(entry.path()) {
                 if meta.is_file() {
                     total += meta.len();
                 }
@@ -124,6 +133,7 @@ async fn get_status(State(state): State<AppState>) -> impl IntoResponse {
         model_name: loader.model_name().map(|s| s.to_string()),
         model_format: loader.model_format().map(|s| s.to_string()),
         backend: loader.backend_name().to_string(),
+        lora_adapter: loader.lora_adapter().map(|s| s.to_string()),
     })
 }
 
@@ -147,15 +157,19 @@ async fn load_model(
     }
 }
 
-fn find_gguf_files(dir: &std::path::Path) -> Vec<PathBuf> {
+fn find_mlx_packs(dir: &std::path::Path) -> Vec<PathBuf> {
     let mut results = Vec::new();
     if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.flatten() {
             let path = entry.path();
             if path.is_dir() {
-                results.extend(find_gguf_files(&path));
-            } else if path.extension().map(|e| e == "gguf").unwrap_or(false) {
-                results.push(path);
+                // Check if this directory is an MLX pack
+                if detect_format(&path) == "mlx" {
+                    results.push(path);
+                } else {
+                    // Recurse into subdirectories
+                    results.extend(find_mlx_packs(&path));
+                }
             }
         }
     }
@@ -165,13 +179,24 @@ fn find_gguf_files(dir: &std::path::Path) -> Vec<PathBuf> {
 async fn auto_load_model(
     State(state): State<AppState>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let gguf_files = find_gguf_files(&state.model_dir);
-    let model_path = match gguf_files.first() {
+    let mlx_packs = find_mlx_packs(&state.model_dir);
+
+    // Prefer the bonsai-1.7b-mlx-1bit pack if available
+    let model_path = mlx_packs
+        .iter()
+        .find(|p| {
+            p.file_name()
+                .map(|n| n.to_string_lossy().contains("bonsai-1.7b-mlx-1bit"))
+                .unwrap_or(false)
+        })
+        .or_else(|| mlx_packs.first());
+
+    let model_path = match model_path {
         Some(p) => p,
         None => return Err((
             StatusCode::NOT_FOUND,
             Json(ErrorResponse {
-                error: format!("No .gguf files found in {}", state.model_dir.display()),
+                error: format!("No MLX model packs found in {}", state.model_dir.display()),
             }),
         )),
     };
@@ -181,7 +206,7 @@ async fn auto_load_model(
         Ok(()) => Ok(Json(serde_json::json!({
             "status": "loaded",
             "model_path": model_path.to_string_lossy(),
-            "format": "gguf",
+            "format": "mlx",
         }))),
         Err(e) => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -241,6 +266,77 @@ async fn unload_model(State(state): State<AppState>) -> impl IntoResponse {
     Json(serde_json::json!({"status": "unloaded"}))
 }
 
+/// Load or hot-swap a LoRA adapter.
+/// Body: { "adapter_path": "/path/to/adapter/dir" }
+async fn load_lora(
+    State(state): State<AppState>,
+    Json(req): Json<serde_json::Value>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let adapter_path = req
+        .get("adapter_path")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if adapter_path.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "adapter_path required".to_string(),
+            }),
+        ));
+    }
+    if !PathBuf::from(adapter_path).exists() {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: format!("adapter directory not found: {}", adapter_path),
+            }),
+        ));
+    }
+
+    let mut loader = state.loader.write().await;
+    match loader.load_lora(adapter_path).await {
+        Ok(()) => Ok(Json(serde_json::json!({
+            "status": "ok",
+            "adapter": adapter_path,
+        }))),
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: e.to_string(),
+            }),
+        )),
+    }
+}
+
+/// Detach the current LoRA adapter (revert to base model).
+async fn detach_lora(
+    State(state): State<AppState>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let mut loader = state.loader.write().await;
+    match loader.detach_lora().await {
+        Ok(()) => Ok(Json(serde_json::json!({
+            "status": "ok",
+            "adapter": null,
+        }))),
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: e.to_string(),
+            }),
+        )),
+    }
+}
+
+/// Get the current LoRA adapter status.
+async fn lora_status(State(state): State<AppState>) -> impl IntoResponse {
+    let loader = state.loader.read().await;
+    let adapter = loader.lora_adapter();
+    Json(serde_json::json!({
+        "status": if adapter.is_some() { "loaded" } else { "none" },
+        "adapter": adapter,
+    }))
+}
+
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt()
@@ -271,6 +367,9 @@ async fn main() {
         .route("/api/auto-load", post(auto_load_model))
         .route("/api/unload", post(unload_model))
         .route("/api/chat", post(chat))
+        .route("/api/lora/load", post(load_lora))
+        .route("/api/lora/detach", post(detach_lora))
+        .route("/api/lora/status", get(lora_status))
         .layer(CorsLayer::permissive())
         .with_state(state);
 

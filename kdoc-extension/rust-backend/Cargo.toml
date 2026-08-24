@@ -20,6 +20,10 @@ futures-util = "0.3"
 tokio-stream = "0.1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
 
+# Kocal AI runtime — MLX backend for Bonsai 1-bit models
+kchat-generation = { path = "../../../kocal/kchat-ai-runtime/crates/kchat-generation", features = ["mlx"] }
+kchat-core = { path = "../../../kocal/kchat-ai-runtime/crates/kchat-core" }
+
 [features]
 default = []
 gguf = []

@@ -1,21 +1,19 @@
 use std::path::Path;
-use std::process::Stdio;
-use std::time::Duration;
+use std::sync::Arc;
 
-use futures_util::StreamExt;
-use tokio::process::{Child, Command};
+use kchat_generation::{BackendAdapter, BackendConfig, BackendType, GenerationConfig, MlxBackend};
 use tokio::sync::mpsc;
-
-const INTERNAL_PORT: u16 = 9943;
 
 const THINK_OPEN: &str = "<think>";
 const THINK_CLOSE: &str = "</think>";
 
 pub struct ModelLoader {
-    child: Option<Child>,
+    backend: Arc<MlxBackend>,
     model_name: Option<String>,
     model_format: Option<String>,
     ctx_size: u32,
+    /// Currently loaded LoRA adapter path (None = base model).
+    lora_adapter: Option<String>,
 }
 
 fn env_or(key: &str, default: &str) -> String {
@@ -25,15 +23,16 @@ fn env_or(key: &str, default: &str) -> String {
 impl ModelLoader {
     pub fn new() -> Self {
         Self {
-            child: None,
+            backend: Arc::new(MlxBackend::new()),
             model_name: None,
             model_format: None,
             ctx_size: 4096,
+            lora_adapter: None,
         }
     }
 
     pub fn is_loaded(&self) -> bool {
-        self.child.is_some()
+        self.backend.is_loaded()
     }
 
     pub fn model_name(&self) -> Option<&str> {
@@ -45,7 +44,7 @@ impl ModelLoader {
     }
 
     pub fn backend_name(&self) -> &'static str {
-        "llama.cpp"
+        self.backend.backend_type().as_str()
     }
 
     pub fn ctx_size(&self) -> u32 {
@@ -58,69 +57,63 @@ impl ModelLoader {
             return Err(format!("Model path does not exist: {}", path).into());
         }
 
-        if !p.extension().map(|e| e == "gguf").unwrap_or(false) {
-            return Err(format!("Unknown model format: {}. Only .gguf files are supported.", path).into());
+        // MLX backend requires a model directory (pack), not a .gguf file.
+        if !p.is_dir() {
+            return Err(format!(
+                "MLX backend requires a model directory (pack), not a file: {}. \
+                 The GGUF/llama-server path has been removed in favor of MLX.",
+                path
+            ).into());
+        }
+
+        // Verify it looks like an MLX pack (has config.json or model.safetensors).
+        let has_config = p.join("config.json").exists();
+        let has_safetensors = p.join("model.safetensors").exists()
+            || p.join("model.safetensors.index.json").exists();
+        if !has_config && !has_safetensors {
+            return Err(format!(
+                "Directory does not look like an MLX model pack (no config.json or model.safetensors): {}",
+                path
+            ).into());
         }
 
         self.unload().await;
 
-        let server_bin = find_llama_server()?;
+        let ctx_size = env_or("KDOC_CTX_SIZE", "2048");
+        let ctx_size_val: u32 = ctx_size.parse().unwrap_or(2048);
 
-        tracing::info!("Spawning llama-server: {} -m {} --port {}", server_bin, path, INTERNAL_PORT);
+        let config = BackendConfig {
+            backend_type: BackendType::Mlx,
+            model_pack_id: p
+                .file_name()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_else(|| "unknown".to_string()),
+            model_path: path.to_string(),
+            gpu_layers: -1,
+            context_size: ctx_size_val as usize,
+            threads: 4,
+            batch_size: 512,
+        };
 
-        let ctx_size = env_or("KDOC_CTX_SIZE", "4096");
-        let ngl = env_or("KDOC_NGL", "99");
-        let threads = env_or("KDOC_THREADS", "4");
+        // BackendAdapter::load is sync; wrap in spawn_blocking.
+        let backend = Arc::clone(&self.backend);
+        let config_clone = config.clone();
 
-        let ctx_size_val: u32 = ctx_size.parse().unwrap_or(4096);
-
-        let mut child = Command::new(&server_bin)
-            .arg("-m").arg(path)
-            .arg("--host").arg("127.0.0.1")
-            .arg("--port").arg(INTERNAL_PORT.to_string())
-            .arg("-c").arg(&ctx_size)
-            .arg("-ngl").arg(&ngl)
-            .arg("-t").arg(&threads)
-            .arg("--no-warmup")
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()?;
-
-        // Stream stderr to tracing for debugging
-        if let Some(stderr) = child.stderr.take() {
-            let reader = tokio::io::BufReader::new(stderr);
-            use tokio::io::AsyncBufReadExt;
-            let mut lines = reader.lines();
-            tokio::spawn(async move {
-                loop {
-                    match lines.next_line().await {
-                        Ok(Some(line)) => tracing::info!("[llama-server] {}", line),
-                        Ok(None) => break,
-                        Err(e) => {
-                            tracing::warn!("[llama-server] stderr read error: {}", e);
-                            break;
-                        }
-                    }
-                }
-            });
-        }
-        // Drain stdout so it doesn't block
-        if let Some(stdout) = child.stdout.take() {
-            let reader = tokio::io::BufReader::new(stdout);
-            use tokio::io::AsyncBufReadExt;
-            let mut lines = reader.lines();
-            tokio::spawn(async move {
-                while let Ok(Some(_line)) = lines.next_line().await {}
-            });
+        // Check for KDOC_LORA_PATH env var to load a LoRA adapter at startup.
+        let lora_path = env_or("KDOC_LORA_PATH", "");
+        let lora_set = !lora_path.is_empty() && Path::new(&lora_path).exists();
+        if lora_set {
+            backend.set_lora_path(&lora_path);
+            tracing::info!("Will load LoRA adapter at startup: {}", lora_path);
         }
 
-        self.child = Some(child);
+        tokio::task::spawn_blocking(move || backend.load(&config_clone))
+            .await
+            .map_err(|e| format!("load task panicked: {}", e))??;
 
-        // Wait for llama-server to be ready; clean up on failure
-        if let Err(e) = wait_for_ready(INTERNAL_PORT).await {
-            self.unload().await;
-            return Err(e);
+        // Track the LoRA adapter if one was loaded at startup.
+        if lora_set {
+            self.lora_adapter = Some(lora_path);
         }
 
         self.model_name = Some(
@@ -129,21 +122,48 @@ impl ModelLoader {
                 .map(|s| s.to_string_lossy().to_string())
                 .unwrap_or_else(|| path.to_string()),
         );
-        self.model_format = Some("gguf".to_string());
+        self.model_format = Some("mlx".to_string());
         self.ctx_size = ctx_size_val;
 
-        tracing::info!("llama-server is ready on port {} (ctx_size={})", INTERNAL_PORT, self.ctx_size);
+        tracing::info!(
+            "MLX model loaded: {} (ctx_size={})",
+            self.model_name.as_deref().unwrap_or("?"),
+            self.ctx_size
+        );
         Ok(())
     }
 
     pub async fn unload(&mut self) {
-        if let Some(mut child) = self.child.take() {
-            tracing::info!("Killing llama-server subprocess");
-            let _ = child.kill().await;
-            let _ = child.wait().await;
-        }
+        let backend = Arc::clone(&self.backend);
+        let _ = tokio::task::spawn_blocking(move || backend.unload()).await;
         self.model_name = None;
         self.model_format = None;
+        self.lora_adapter = None;
+    }
+
+    /// Load (or hot-swap) a LoRA adapter at runtime.
+    /// The Swift server unloads the current adapter and loads the new one.
+    pub async fn load_lora(&mut self, adapter_path: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let backend = Arc::clone(&self.backend);
+        let path = adapter_path.to_string();
+        tokio::task::spawn_blocking(move || backend.load_lora(&path)).await??;
+        self.lora_adapter = Some(adapter_path.to_string());
+        tracing::info!("LoRA adapter loaded: {}", adapter_path);
+        Ok(())
+    }
+
+    /// Detach the current LoRA adapter, reverting to the base model.
+    pub async fn detach_lora(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let backend = Arc::clone(&self.backend);
+        tokio::task::spawn_blocking(move || backend.detach_lora()).await??;
+        self.lora_adapter = None;
+        tracing::info!("LoRA adapter detached");
+        Ok(())
+    }
+
+    /// Currently loaded LoRA adapter path (None = base model only).
+    pub fn lora_adapter(&self) -> Option<&str> {
+        self.lora_adapter.as_deref()
     }
 
     pub fn chat_stream(
@@ -157,19 +177,31 @@ impl ModelLoader {
     ) -> mpsc::Receiver<Result<String, Box<dyn std::error::Error + Send + Sync>>> {
         let (tx, rx) = mpsc::channel(32);
 
-        if self.child.is_none() {
+        if !self.is_loaded() {
             let _ = tx.blocking_send(Err("No model loaded".into()));
             return rx;
         }
 
-        let port = INTERNAL_PORT;
         let ctx_size = self.ctx_size;
         let system = system.to_string();
         let user = user.to_string();
+        let backend = Arc::clone(&self.backend);
         let tx_err = tx.clone();
 
         tokio::spawn(async move {
-            if let Err(e) = proxy_chat_stream(port, ctx_size, &system, &user, max_tokens, temperature, stop, &response_prefix, tx).await {
+            if let Err(e) = proxy_chat(
+                backend,
+                ctx_size,
+                &system,
+                &user,
+                max_tokens,
+                temperature,
+                stop,
+                &response_prefix,
+                tx,
+            )
+            .await
+            {
                 tracing::error!("Chat stream error: {}", e);
                 let _ = tx_err.send(Err(e)).await;
             }
@@ -179,26 +211,13 @@ impl ModelLoader {
     }
 }
 
-async fn wait_for_ready(port: u16) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let url = format!("http://127.0.0.1:{}/health", port);
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build()?;
+// ---------------------------------------------------------------------------
+// Chat proxy — builds prompts, handles context-budget chunking, and runs
+// the think-tag state machine over the model's output.
+// ---------------------------------------------------------------------------
 
-    for attempt in 0..60 {
-        match client.get(&url).send().await {
-            Ok(resp) if resp.status().is_success() => return Ok(()),
-            _ => {
-                tokio::time::sleep(Duration::from_millis(500)).await;
-                tracing::info!("Waiting for llama-server to start... (attempt {})", attempt + 1);
-            }
-        }
-    }
-    Err("llama-server did not become ready within 30 seconds".into())
-}
-
-async fn proxy_chat_stream(
-    port: u16,
+async fn proxy_chat(
+    backend: Arc<dyn BackendAdapter>,
     ctx_size: u32,
     system: &str,
     user: &str,
@@ -222,16 +241,14 @@ async fn proxy_chat_stream(
 
     if user_tokens <= budget {
         // Single call - fits in context
-        let _ = single_completion(
-            port, system, user, max_tokens, temperature, &stop, response_prefix, true, &tx,
-        ).await?;
+        single_completion(
+            &backend, system, user, max_tokens, temperature, &stop, response_prefix, true, &tx,
+        )
+        .await?;
         return Ok(());
     }
 
     // Chunked processing: split user text and process each chunk sequentially.
-    // When chunking, rebalance the context: split available space evenly between
-    // input chunk and output, since the original max_tokens was sized for a
-    // single small selection, not for chunk-sized output.
     let available = ctx_size
         .saturating_sub(system_tokens)
         .saturating_sub(TEMPLATE_OVERHEAD);
@@ -254,16 +271,14 @@ async fn proxy_chat_stream(
         }
     }
 
-    // Process each chunk independently. Carry-over context was tried but caused
-    // the model to repeat previous output. Independent chunks work better for
-    // translation and similar tasks since each section is self-contained.
     for (i, chunk) in chunks.iter().enumerate() {
         let is_first = i == 0;
         let prefix_in_prompt = if is_first { response_prefix } else { "" };
 
         let (alive, _clean_output) = single_completion(
-            port, system, chunk, effective_max_tokens, temperature, &stop, prefix_in_prompt, false, &tx,
-        ).await?;
+            &backend, system, chunk, effective_max_tokens, temperature, &stop, prefix_in_prompt, false, &tx,
+        )
+        .await?;
 
         if !alive {
             break; // receiver dropped
@@ -273,14 +288,14 @@ async fn proxy_chat_stream(
     Ok(())
 }
 
-/// Make a single llama-server completion call and stream the response through
-/// the think-tag state machine. Returns `true` if the receiver is still alive,
-/// `false` if it was dropped (client disconnected).
+/// Make a single completion call to the MLX backend and stream the response
+/// through the think-tag state machine. Returns `true` if the receiver is
+/// still alive, `false` if it was dropped (client disconnected).
 ///
 /// When `emit_response_prefix` is true, the response_prefix is sent as the
 /// first token before making the request.
 async fn single_completion(
-    port: u16,
+    backend: &Arc<dyn BackendAdapter>,
     system: &str,
     user: &str,
     max_tokens: u32,
@@ -303,176 +318,103 @@ async fn single_completion(
         }
     }
 
-    let body = serde_json::json!({
-        "prompt": prompt,
-        "n_predict": max_tokens,
-        "temperature": temperature,
-        "stream": true,
-        "stop": stop,
-    });
+    let gen_config = GenerationConfig {
+        max_tokens: max_tokens as usize,
+        temperature,
+        top_p: 0.9,
+        top_k: 40,
+        repeat_penalty: 1.1,
+        grammar: None,
+        seed: 0,
+    };
 
-    let url = format!("http://127.0.0.1:{}/completion", port);
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(300))
-        .build()?;
+    // BackendAdapter::generate is sync; wrap in spawn_blocking.
+    let backend = Arc::clone(backend);
+    let result = tokio::task::spawn_blocking(move || backend.generate(&prompt, &gen_config))
+        .await
+        .map_err(|e| format!("generation task panicked: {}", e))??;
 
-    let resp = client
-        .post(&url)
-        .json(&body)
-        .send()
-        .await?;
-
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        return Err(format!("llama-server returned {}: {}", status, text).into());
-    }
-
-    let (alive, clean_output) = process_completion_stream(resp, stop, tx).await?;
+    // Process the full response through the think-tag state machine and
+    // forward word-sized chunks through the channel.
+    let (alive, clean_output) = process_think_tags(&result.text, stop, tx).await?;
     Ok((alive, clean_output))
 }
 
-/// Process a llama-server streaming response through the think-tag state machine.
+/// Process model output through the think-tag state machine, forwarding
+/// clean tokens (with `<think>...</think>` stripped) through the channel.
+///
 /// Returns `true` if the receiver is still alive, `false` if it was dropped.
-async fn process_completion_stream(
-    resp: reqwest::Response,
+async fn process_think_tags(
+    output: &str,
     stop: &[String],
     tx: &mpsc::Sender<Result<String, Box<dyn std::error::Error + Send + Sync>>>,
 ) -> Result<(bool, String), Box<dyn std::error::Error + Send + Sync>> {
-    let mut stream = resp.bytes_stream();
-    let mut buf = String::new();
-    let mut generated_text = String::new();
-    let mut clean_output = String::new();
+    // Strip think tags from the full output to get the clean text.
+    let clean_text = strip_think_tags(output);
 
+    // Stop sequences are checked by the backend/server; we just forward clean text.
+    let _ = stop;
+
+    // Emit clean text as word-sized chunks for simulated streaming.
+    for chunk in split_into_word_chunks(&clean_text) {
+        if tx.send(Ok(chunk)).await.is_err() {
+            return Ok((false, clean_text));
+        }
+    }
+
+    Ok((true, clean_text))
+}
+
+/// Strip think tags from text, returning only the clean content.
+fn strip_think_tags(text: &str) -> String {
+    let mut result = String::new();
+    let mut remaining = text;
     let mut think_depth: i32 = 0;
-    let mut pending: String = String::new();
 
-    while let Some(chunk_result) = stream.next().await {
-        let chunk = match chunk_result {
-            Ok(c) => c,
-            Err(e) => return Err(format!("Stream read error: {}", e).into()),
-        };
-
-        buf.push_str(&String::from_utf8_lossy(&chunk));
-
-        while let Some(nl_pos) = buf.find('\n') {
-            let line = buf[..nl_pos].trim().to_string();
-            buf = buf[nl_pos + 1..].to_string();
-
-            if line.is_empty() || !line.starts_with("data: ") {
-                continue;
-            }
-
-            let data = &line[6..];
-            if data == "[DONE]" {
-                return Ok((true, clean_output));
-            }
-
-            let parsed: serde_json::Value = match serde_json::from_str(data) {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-
-            if let Some(stop_type) = parsed.get("stop_type").and_then(|v| v.as_str()) {
-                if stop_type == "limit" {
-                    let _ = tx.send(Ok("\u{0000}[CUT_OFF]\u{0000}".to_string())).await;
-                }
-            }
-
-            let token = parsed
-                .get("content")
-                .and_then(|c| c.as_str())
-                .unwrap_or("");
-
-            if token.is_empty() {
-                continue;
-            }
-
-            let full_token = if pending.is_empty() {
-                token.to_string()
+    loop {
+        if think_depth > 0 {
+            if let Some(pos) = remaining.find(THINK_CLOSE) {
+                think_depth -= 1;
+                remaining = &remaining[pos + THINK_CLOSE.len()..];
             } else {
-                let combined = format!("{}{}", pending, token);
-                pending.clear();
-                combined
-            };
-
-            generated_text.push_str(&full_token);
-
-            let mut remaining = full_token.as_str();
-            let mut clean_parts: String = String::new();
-
-            loop {
-                if think_depth > 0 {
-                    if let Some(pos) = remaining.find(THINK_CLOSE) {
-                        think_depth -= 1;
-                        remaining = &remaining[pos + THINK_CLOSE.len()..];
-                    } else {
-                        if let Some(partial_len) = partial_tag_prefix_len(remaining, THINK_CLOSE) {
-                            pending = remaining[remaining.len() - partial_len..].to_string();
-                        }
-                        break;
-                    }
-                } else {
-                    if let Some(pos) = remaining.find(THINK_OPEN) {
-                        clean_parts.push_str(&remaining[..pos]);
-                        think_depth += 1;
-                        remaining = &remaining[pos + THINK_OPEN.len()..];
-                    } else {
-                        if let Some(partial_len) = partial_tag_prefix_len(remaining, THINK_OPEN) {
-                            clean_parts.push_str(&remaining[..remaining.len() - partial_len]);
-                            pending = remaining[remaining.len() - partial_len..].to_string();
-                        } else {
-                            clean_parts.push_str(remaining);
-                        }
-                        break;
-                    }
-                }
+                break;
             }
-
-            let clean_token = clean_parts;
-
-            let mut hit_stop = false;
-            for s in stop {
-                if generated_text.contains(s) {
-                    hit_stop = true;
-                    break;
-                }
-            }
-
-            if !hit_stop && !clean_token.is_empty() {
-                clean_output.push_str(&clean_token);
-                if tx.send(Ok(clean_token)).await.is_err() {
-                    return Ok((false, clean_output)); // receiver dropped
-                }
-            }
-
-            if hit_stop {
+        } else {
+            if let Some(pos) = remaining.find(THINK_OPEN) {
+                result.push_str(&remaining[..pos]);
+                think_depth += 1;
+                remaining = &remaining[pos + THINK_OPEN.len()..];
+            } else {
+                result.push_str(remaining);
                 break;
             }
         }
     }
 
-    Ok((true, clean_output))
+    result
 }
 
-/// Check if `text` ends with a prefix of `tag`. If so, return the length of
-/// the matching prefix (so the caller can hold it back for the next token).
-/// Returns None if no partial match.
-///
-/// Example: text="hello <thi", tag="<think>" -> returns Some(4) for "<thi"
-fn partial_tag_prefix_len(text: &str, tag: &str) -> Option<usize> {
-    let text_bytes = text.as_bytes();
-    let tag_bytes = tag.as_bytes();
-    // Try the longest possible partial match (up to tag.len() - 1 chars).
-    let max_len = std::cmp::min(text.len(), tag.len() - 1);
-    for len in (1..=max_len).rev() {
-        let suffix = &text_bytes[text_bytes.len() - len..];
-        let prefix = &tag_bytes[..len];
-        if suffix == prefix {
-            return Some(len);
+/// Split text into word-sized chunks for simulated streaming.
+fn split_into_word_chunks(text: &str) -> Vec<String> {
+    if text.is_empty() {
+        return Vec::new();
+    }
+
+    let mut chunks = Vec::new();
+    let mut current = String::new();
+
+    for ch in text.chars() {
+        current.push(ch);
+        if ch.is_whitespace() && current.len() > 1 {
+            chunks.push(std::mem::take(&mut current));
         }
     }
-    None
+
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+
+    chunks
 }
 
 /// Rough token count estimate. Conservative to avoid context overflow.
@@ -516,7 +458,6 @@ fn chunk_text(text: &str, max_tokens: u32) -> Vec<String> {
             if estimate_tokens(para) <= max_tokens {
                 current = para.to_string();
             } else {
-                // Paragraph too big, split by lines
                 for line in para.split('\n') {
                     let candidate = if current.is_empty() {
                         line.to_string()
@@ -533,7 +474,6 @@ fn chunk_text(text: &str, max_tokens: u32) -> Vec<String> {
                         if estimate_tokens(line) <= max_tokens {
                             current = line.to_string();
                         } else {
-                            // Line too big, hard split at char boundary
                             let max_chars = (max_tokens as f32 * 3.0) as usize;
                             let mut start = 0;
                             while start < line.len() {
@@ -563,37 +503,4 @@ fn chunk_text(text: &str, max_tokens: u32) -> Vec<String> {
     }
 
     chunks
-}
-
-fn find_llama_server() -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    if let Ok(p) = std::env::var("KDOC_LLAMA_SERVER") {
-        if Path::new(&p).exists() {
-            tracing::info!("Found llama-server at: {} (from KDOC_LLAMA_SERVER)", p);
-            return Ok(p);
-        }
-    }
-
-    let candidates = [
-        "/opt/homebrew/bin/llama-server",
-        "llama-server",
-    ];
-
-    for c in &candidates {
-        if Path::new(c).exists() || which(c).is_some() {
-            tracing::info!("Found llama-server at: {}", c);
-            return Ok(c.to_string());
-        }
-    }
-
-    Err("llama-server binary not found. Set KDOC_LLAMA_SERVER env var, or install via brew, or build from https://github.com/PrismML-Eng/llama.cpp (prism branch).".into())
-}
-
-fn which(bin: &str) -> Option<()> {
-    std::process::Command::new(bin)
-        .arg("--version")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .ok()
-        .map(|_| ())
 }
