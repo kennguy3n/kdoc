@@ -1,7 +1,8 @@
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
-use kchat_generation::{BackendAdapter, BackendConfig, BackendType, GenerationConfig, MlxBackend};
+use kchat_generation::{BackendAdapter, BackendConfig, BackendType, GenerationConfig, MlxBackend, StreamEvent, StreamHandle};
 use tokio::sync::mpsc;
 
 const THINK_OPEN: &str = "<think>";
@@ -294,13 +295,17 @@ async fn proxy_chat(
 ///
 /// When `emit_response_prefix` is true, the response_prefix is sent as the
 /// first token before making the request.
+///
+/// Uses `generate_stream` for true token-by-token streaming. Tokens are
+/// drained from the `StreamHandle` concurrently and forwarded through the
+/// channel after think-tag filtering.
 async fn single_completion(
     backend: &Arc<dyn BackendAdapter>,
     system: &str,
     user: &str,
     max_tokens: u32,
     temperature: f32,
-    stop: &[String],
+    _stop: &[String],
     response_prefix: &str,
     emit_response_prefix: bool,
     tx: &mpsc::Sender<Result<String, Box<dyn std::error::Error + Send + Sync>>>,
@@ -328,93 +333,192 @@ async fn single_completion(
         seed: 0,
     };
 
-    // BackendAdapter::generate is sync; wrap in spawn_blocking.
-    let backend = Arc::clone(backend);
-    let result = tokio::task::spawn_blocking(move || backend.generate(&prompt, &gen_config))
-        .await
-        .map_err(|e| format!("generation task panicked: {}", e))??;
+    // Create a StreamHandle for the backend to push tokens to.
+    let stream_handle = Arc::new(StreamHandle::new());
+    let stream_for_drainer = Arc::clone(&stream_handle);
+    let stream_for_gen = Arc::clone(&stream_handle);
 
-    // Process the full response through the think-tag state machine and
-    // forward word-sized chunks through the channel.
-    let (alive, clean_output) = process_think_tags(&result.text, stop, tx).await?;
+    // Spawn a concurrent drainer that polls the StreamHandle for new events
+    // and forwards tokens through the channel after think-tag filtering.
+    let tx_for_drainer = tx.clone();
+    let drainer = tokio::spawn(async move {
+        let mut think_filter = StreamingThinkFilter::new();
+        let mut clean_output = String::new();
+        let mut alive = true;
+
+        loop {
+            let events = stream_for_drainer.drain_events();
+            for event in events {
+                match event {
+                    StreamEvent::Token { text } => {
+                        let clean = think_filter.push(&text);
+                        if !clean.is_empty() {
+                            clean_output.push_str(&clean);
+                            if tx_for_drainer.send(Ok(clean)).await.is_err() {
+                                alive = false;
+                                break;
+                            }
+                        }
+                    }
+                    StreamEvent::Complete { .. } => {
+                        // Flush remaining buffered text
+                        let remaining = think_filter.flush();
+                        if !remaining.is_empty() {
+                            clean_output.push_str(&remaining);
+                            let _ = tx_for_drainer.send(Ok(remaining)).await;
+                        }
+                        return (alive, clean_output);
+                    }
+                    StreamEvent::Cancelled { .. } => {
+                        let remaining = think_filter.flush();
+                        if !remaining.is_empty() {
+                            clean_output.push_str(&remaining);
+                            let _ = tx_for_drainer.send(Ok(remaining)).await;
+                        }
+                        return (alive, clean_output);
+                    }
+                    StreamEvent::Error { message } => {
+                        let _ = tx_for_drainer.send(Err(message.into())).await;
+                        return (alive, clean_output);
+                    }
+                }
+                if !alive {
+                    break;
+                }
+            }
+            if !alive {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        (alive, clean_output)
+    });
+
+    // Run generate_stream in spawn_blocking (it's a sync blocking call).
+    let backend = Arc::clone(backend);
+    let gen_result = tokio::task::spawn_blocking(move || {
+        backend.generate_stream(&prompt, &gen_config, &stream_for_gen)
+    })
+    .await
+    .map_err(|e| format!("generation task panicked: {}", e))??;
+
+    // Wait for the drainer to finish forwarding all tokens.
+    let (alive, clean_output) = drainer.await.unwrap_or((true, gen_result.text.clone()));
+
     Ok((alive, clean_output))
 }
 
-/// Process model output through the think-tag state machine, forwarding
-/// clean tokens (with `<think>...</think>` stripped) through the channel.
+/// Streaming think-tag filter — processes tokens incrementally and emits
+/// only clean text (outside think blocks).
 ///
-/// Returns `true` if the receiver is still alive, `false` if it was dropped.
-async fn process_think_tags(
-    output: &str,
-    stop: &[String],
-    tx: &mpsc::Sender<Result<String, Box<dyn std::error::Error + Send + Sync>>>,
-) -> Result<(bool, String), Box<dyn std::error::Error + Send + Sync>> {
-    // Strip think tags from the full output to get the clean text.
-    let clean_text = strip_think_tags(output);
+/// Maintains a buffer to handle think tags that span multiple tokens.
+/// Text that could be part of a partial tag match is held back until
+/// more data arrives or `flush()` is called.
+struct StreamingThinkFilter {
+    /// Accumulated text not yet emitted (may contain partial tags)
+    buffer: String,
+    /// True if currently inside a think block
+    in_think: bool,
+}
 
-    // Stop sequences are checked by the backend/server; we just forward clean text.
-    let _ = stop;
-
-    // Emit clean text as word-sized chunks for simulated streaming.
-    for chunk in split_into_word_chunks(&clean_text) {
-        if tx.send(Ok(chunk)).await.is_err() {
-            return Ok((false, clean_text));
+impl StreamingThinkFilter {
+    fn new() -> Self {
+        Self {
+            buffer: String::new(),
+            in_think: false,
         }
     }
 
-    Ok((true, clean_text))
-}
+    /// Push a new token and return any clean text that can be emitted.
+    fn push(&mut self, token: &str) -> String {
+        self.buffer.push_str(token);
+        self.process_buffer()
+    }
 
-/// Strip think tags from text, returning only the clean content.
-fn strip_think_tags(text: &str) -> String {
-    let mut result = String::new();
-    let mut remaining = text;
-    let mut think_depth: i32 = 0;
-
-    loop {
-        if think_depth > 0 {
-            if let Some(pos) = remaining.find(THINK_CLOSE) {
-                think_depth -= 1;
-                remaining = &remaining[pos + THINK_CLOSE.len()..];
-            } else {
-                break;
-            }
+    /// Flush all remaining buffered text (called at end of generation).
+    /// Any incomplete tag matches are emitted as-is.
+    fn flush(&mut self) -> String {
+        if self.in_think {
+            // Inside a think block at end — discard remaining buffer
+            String::new()
         } else {
-            if let Some(pos) = remaining.find(THINK_OPEN) {
-                result.push_str(&remaining[..pos]);
-                think_depth += 1;
-                remaining = &remaining[pos + THINK_OPEN.len()..];
+            // Outside think block — emit everything
+            std::mem::take(&mut self.buffer)
+        }
+    }
+
+    /// Process the buffer, extracting and returning clean text.
+    /// Leaves only text that could be part of a partial tag in the buffer.
+    fn process_buffer(&mut self) -> String {
+        let mut output = String::new();
+
+        loop {
+            if self.in_think {
+                // Look for THINK_CLOSE
+                if let Some(pos) = self.buffer.find(THINK_CLOSE) {
+                    // Skip everything up to and including the close tag
+                    self.buffer = self.buffer[pos + THINK_CLOSE.len()..].to_string();
+                    self.in_think = false;
+                    continue;
+                } else {
+                    // No close tag found — check if buffer ends with a partial match
+                    let partial = partial_suffix(&self.buffer, THINK_CLOSE);
+                    if partial > 0 {
+                        // Keep the partial match in buffer, discard the rest
+                        let safe_end = self.buffer.len() - partial;
+                        self.buffer = self.buffer[safe_end..].to_string();
+                    } else {
+                        // No partial match — discard entire buffer
+                        self.buffer.clear();
+                    }
+                    break;
+                }
             } else {
-                result.push_str(remaining);
-                break;
+                // Look for THINK_OPEN
+                if let Some(pos) = self.buffer.find(THINK_OPEN) {
+                    // Emit text before the tag
+                    output.push_str(&self.buffer[..pos]);
+                    self.buffer = self.buffer[pos + THINK_OPEN.len()..].to_string();
+                    self.in_think = true;
+                    continue;
+                } else {
+                    // No open tag — check if buffer ends with a partial match
+                    let partial = partial_suffix(&self.buffer, THINK_OPEN);
+                    if partial > 0 {
+                        // Emit everything except the partial match
+                        let safe_end = self.buffer.len() - partial;
+                        output.push_str(&self.buffer[..safe_end]);
+                        self.buffer = self.buffer[safe_end..].to_string();
+                    } else {
+                        // No partial match — emit entire buffer
+                        output.push_str(&self.buffer);
+                        self.buffer.clear();
+                    }
+                    break;
+                }
             }
         }
-    }
 
-    result
+        output
+    }
 }
 
-/// Split text into word-sized chunks for simulated streaming.
-fn split_into_word_chunks(text: &str) -> Vec<String> {
-    if text.is_empty() {
-        return Vec::new();
-    }
+/// Returns the length of the suffix of `text` that is a prefix of `tag`.
+/// This is used to detect partial tag matches at the end of a buffer.
+fn partial_suffix(text: &str, tag: &str) -> usize {
+    let text_bytes = text.as_bytes();
+    let tag_bytes = tag.as_bytes();
+    let max_check = text_bytes.len().min(tag_bytes.len() - 1);
 
-    let mut chunks = Vec::new();
-    let mut current = String::new();
-
-    for ch in text.chars() {
-        current.push(ch);
-        if ch.is_whitespace() && current.len() > 1 {
-            chunks.push(std::mem::take(&mut current));
+    for len in (1..=max_check).rev() {
+        let suffix = &text_bytes[text_bytes.len() - len..];
+        let prefix = &tag_bytes[..len];
+        if suffix == prefix {
+            return len;
         }
     }
-
-    if !current.is_empty() {
-        chunks.push(current);
-    }
-
-    chunks
+    0
 }
 
 /// Rough token count estimate. Conservative to avoid context overflow.
