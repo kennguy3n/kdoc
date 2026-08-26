@@ -749,7 +749,8 @@ export function AIPanel({ editor, open, onClose }: AIPanelProps) {
       setContinuationRound(0)
       setStatus('streaming')
 
-      const { system, user } = action.buildPrompt(input, needsChunking ? '' : context, keywords)
+      const { system, user, responsePrefix: dynamicPrefix } = action.buildPrompt(input, needsChunking ? '' : context, keywords)
+      const responsePrefix = dynamicPrefix ?? action.responsePrefix
 
       // Dispatch strategy:
       //   generate_document       -> sectioned generation (outline -> per-section)
@@ -792,7 +793,7 @@ export function AIPanel({ editor, open, onClose }: AIPanelProps) {
           action.maxTokens,
           action.temperature,
           action.stop,
-          action.responsePrefix,
+          responsePrefix,
           (token) => {
             setOutput((prev) => prev + token)
             if (outputRef.current) {
@@ -862,7 +863,7 @@ export function AIPanel({ editor, open, onClose }: AIPanelProps) {
           },
           (iteration) => setContinuationRound(iteration),
           5,
-          action.responsePrefix,
+          responsePrefix,
         )
       } else {
         await engine.runSkill(
@@ -877,7 +878,7 @@ export function AIPanel({ editor, open, onClose }: AIPanelProps) {
             maxTokens: action.maxTokens,
             temperature: action.temperature,
             stop: action.stop,
-            responsePrefix: action.responsePrefix,
+            responsePrefix,
             buildPrompt: () => ({ system, user }),
           },
           selection,

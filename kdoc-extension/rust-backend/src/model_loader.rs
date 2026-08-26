@@ -305,7 +305,7 @@ async fn single_completion(
     user: &str,
     max_tokens: u32,
     temperature: f32,
-    _stop: &[String],
+    stop: &[String],
     response_prefix: &str,
     emit_response_prefix: bool,
     tx: &mpsc::Sender<Result<String, Box<dyn std::error::Error + Send + Sync>>>,
@@ -328,9 +328,10 @@ async fn single_completion(
         temperature,
         top_p: 0.9,
         top_k: 40,
-        repeat_penalty: 1.1,
+        repeat_penalty: 1.2,
         grammar: None,
         seed: 0,
+        stop: stop.to_vec(),
     };
 
     // Create a StreamHandle for the backend to push tokens to.

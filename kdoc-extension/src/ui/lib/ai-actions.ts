@@ -51,6 +51,13 @@ export interface AIActionDef {
   /** When true, pass the full document text as context (budget-aware). */
   needsFullDocument?: boolean
   /**
+   * LoRA task family for this action. When set, the engine will auto-load
+   * the corresponding LoRA adapter before generation.
+   * Maps to the family names in the LoRA registry: extract_json,
+   * rewrite_grammar, summarize_catchup, doc_creative, slides_deck.
+   */
+  loraTask?: string
+  /**
    * When true, use outline-based context (headings + first sentence per
    * section) instead of full document text. Scales to any document size.
    * Used by suggest_title, write_intro, write_conclusion.
@@ -66,7 +73,7 @@ export interface AIActionDef {
     input: string,
     context?: string,
     keywords?: string,
-  ) => { system: string; user: string }
+  ) => { system: string; user: string; responsePrefix?: string }
 }
 
 function keywordLine(keywords?: string): string {
@@ -99,6 +106,7 @@ export const AI_ACTIONS: Record<string, AIActionDef> = {
     maxTokens: 300,
     temperature: 0.3,
     stop: ['<|im_end|>'],
+    loraTask: 'rewrite_grammar',
     subVariants: [
       { id: 'clarity', label: 'Clarity', context: 'for clarity and readability' },
       { id: 'concise', label: 'Concise', context: 'to be more concise' },
@@ -121,6 +129,7 @@ export const AI_ACTIONS: Record<string, AIActionDef> = {
     maxTokens: 300,
     temperature: 0.2,
     stop: ['<|im_end|>'],
+    loraTask: 'rewrite_grammar',
     buildPrompt: (selection) => ({
       system: 'Fix spelling and grammar errors only. Keep meaning and style. Output only the corrected text.',
       user: selection,
@@ -138,6 +147,7 @@ export const AI_ACTIONS: Record<string, AIActionDef> = {
     maxTokens: 300,
     temperature: 0.3,
     stop: ['<|im_end|>'],
+    loraTask: 'rewrite_grammar',
     buildPrompt: (selection) => ({
       system: 'Simplify the text. Use shorter sentences and simpler words. Output only the simplified text.',
       user: selection,
@@ -155,6 +165,7 @@ export const AI_ACTIONS: Record<string, AIActionDef> = {
     maxTokens: 300,
     temperature: 0.3,
     stop: ['<|im_end|>'],
+    loraTask: 'rewrite_grammar',
     subVariants: [
       { id: 'professional', label: 'Professional', context: 'in a professional tone' },
       { id: 'casual', label: 'Casual', context: 'in a casual, friendly tone' },
@@ -178,6 +189,7 @@ export const AI_ACTIONS: Record<string, AIActionDef> = {
     maxTokens: 400,
     temperature: 0.5,
     stop: ['<|im_end|>'],
+    loraTask: 'rewrite_grammar',
     buildPrompt: (selection) => ({
       system: 'Expand the text with more detail, examples, and depth. Keep the same style and meaning. Output only the expanded text.',
       user: selection,
@@ -195,6 +207,7 @@ export const AI_ACTIONS: Record<string, AIActionDef> = {
     maxTokens: 200,
     temperature: 0.3,
     stop: ['<|im_end|>'],
+    loraTask: 'rewrite_grammar',
     buildPrompt: (selection) => ({
       system: 'Condense the text to be shorter. Keep all key information. Do not use bullet points. Output only the shortened text.',
       user: selection,
@@ -209,9 +222,10 @@ export const AI_ACTIONS: Record<string, AIActionDef> = {
     group: 'refine',
     scope: 'selection',
     mode: 'replace',
-    maxTokens: 300,
+    maxTokens: 1024,
     temperature: 0.2,
     stop: ['<|im_end|>'],
+    loraTask: 'rewrite_grammar',
     subVariants: [
       { id: 'spanish', label: 'Spanish', context: 'Spanish' },
       { id: 'french', label: 'French', context: 'French' },
@@ -220,10 +234,25 @@ export const AI_ACTIONS: Record<string, AIActionDef> = {
       { id: 'chinese', label: 'Chinese', context: 'Chinese' },
       { id: 'vietnamese', label: 'Vietnamese', context: 'Vietnamese' },
     ],
-    buildPrompt: (selection, context) => ({
-      system: `Translate to ${context || 'Spanish'}. Output only the translated text.`,
-      user: selection,
-    }),
+    buildPrompt: (selection, context) => {
+      const lang = context || 'Spanish'
+      // Language-specific data: native name and native instruction.
+      // Including the target language in its own script primes the model to
+      // output in that script and reduces code-switching.
+      const langData: Record<string, { native: string; instruction: string }> = {
+        Spanish: { native: 'español', instruction: 'Traduzca el siguiente texto al español. No deje ninguna palabra ni título en inglés.' },
+        French: { native: 'français', instruction: 'Traduisez le texte suivant en français. Ne laissez aucun mot ni titre en anglais.' },
+        German: { native: 'Deutsch', instruction: 'Übersetzen Sie den folgenden Text ins Deutsche. Lassen Sie keine englischen Wörter oder Überschriften stehen.' },
+        Japanese: { native: '日本語', instruction: '以下のテキストを日本語に翻訳してください。英語の単語や見出しを残さないでください。' },
+        Chinese: { native: '中文', instruction: '请将以下文本翻译成中文。所有英文单词和标题都必须翻译成中文，只有专有名词（如Apple、App Store、GDPR）可以保留英文。' },
+        Vietnamese: { native: 'Tiếng Việt', instruction: 'Vui lòng dịch văn bản sau sang tiếng Việt. Không để lại bất kỳ từ hoặc tiêu đề tiếng Anh nào.' },
+      }
+      const ld = langData[lang] || { native: lang, instruction: `Translate to ${lang}. Do not leave any English words or headings untranslated.` }
+      return {
+        system: `You are a professional translator. Translate the following text into ${lang} (${ld.native}). ${ld.instruction}\nRules:\n1. Translate ALL text completely — do not leave any English words, phrases, or headings untranslated.\n2. Output ONLY the translated text, no explanations.\n3. Keep formatting (headings, lists, line breaks) intact.\n4. Translate markdown headings too — do not leave headings in English.\n5. Common English words (suspension, appeal, inactivity, violation, account, review, process, submit, documentation, evidence, verification, security, privacy, encryption) MUST be translated. Only proper nouns (Apple, KChat, App Store, GDPR) may stay in English.\n6. If a term has no direct translation, transliterate it and keep it consistent.`,
+        user: selection,
+      }
+    },
   },
 
   // --- Extract (selection-scoped) ----------------------------------------
@@ -239,6 +268,7 @@ export const AI_ACTIONS: Record<string, AIActionDef> = {
     maxTokens: 150,
     temperature: 0.3,
     stop: ['<|im_end|>'],
+    loraTask: 'summarize_catchup',
     responsePrefix: '- ',
     buildPrompt: (selection) => ({
       system: 'Summarize in 2-3 bullet points starting with "- ". Be concise. Output only the bullets.',
@@ -257,6 +287,7 @@ export const AI_ACTIONS: Record<string, AIActionDef> = {
     maxTokens: 200,
     temperature: 0.3,
     stop: ['<|im_end|>'],
+    loraTask: 'extract_json',
     responsePrefix: '1. ',
     buildPrompt: (selection) => ({
       system: 'Extract 3-5 key takeaways as a numbered list (1. 2. 3.). Be concise. Output only the list.',
@@ -275,6 +306,7 @@ export const AI_ACTIONS: Record<string, AIActionDef> = {
     maxTokens: 150,
     temperature: 0.3,
     stop: ['<|im_end|>'],
+    loraTask: 'extract_json',
     responsePrefix: '- ',
     buildPrompt: (selection) => ({
       system: 'Extract action items as a bullet list starting with "- ". Be concise. Output only the list.',
@@ -293,6 +325,7 @@ export const AI_ACTIONS: Record<string, AIActionDef> = {
     maxTokens: 20,
     temperature: 0.3,
     stop: ['<|im_end|>', '\n'],
+    loraTask: 'doc_creative',
     buildPrompt: (selection) => ({
       system: 'Generate a single concise heading for the text. No quotes. Output only the heading.',
       user: selection,
@@ -312,6 +345,7 @@ export const AI_ACTIONS: Record<string, AIActionDef> = {
     maxTokens: 150,
     temperature: 0.6,
     stop: ['<|im_end|>'],
+    loraTask: 'doc_creative',
     buildPrompt: (_input, context) => ({
       system: 'Continue the text naturally. Keep the same style. Write 2-3 sentences. Output only the continuation.',
       user: context ?? '',
@@ -329,6 +363,7 @@ export const AI_ACTIONS: Record<string, AIActionDef> = {
     maxTokens: 600,
     temperature: 0.7,
     stop: ['<|im_end|>'],
+    loraTask: 'doc_creative',
     responsePrefix: '- ',
     needsTopic: true,
     buildPrompt: (topic) => ({
@@ -348,6 +383,7 @@ export const AI_ACTIONS: Record<string, AIActionDef> = {
     maxTokens: 800,
     temperature: 0.4,
     stop: ['<|im_end|>'],
+    loraTask: 'doc_creative',
     responsePrefix: '# ',
     needsTopic: true,
     supportsKeywords: true,
@@ -371,6 +407,7 @@ export const AI_ACTIONS: Record<string, AIActionDef> = {
     maxTokens: 600,
     temperature: 0.5,
     stop: ['<|im_end|>'],
+    loraTask: 'doc_creative',
     needsTopic: true,
     needsFullDocument: true,
     supportsKeywords: true,
@@ -403,6 +440,7 @@ export const AI_ACTIONS: Record<string, AIActionDef> = {
     maxTokens: 1500,
     temperature: 0.5,
     stop: ['<|im_end|>'],
+    loraTask: 'doc_creative',
     responsePrefix: '# ',
     needsTopic: true,
     supportsKeywords: true,
@@ -428,6 +466,7 @@ export const AI_ACTIONS: Record<string, AIActionDef> = {
     maxTokens: 400,
     temperature: 0.3,
     stop: ['<|im_end|>'],
+    loraTask: 'summarize_catchup',
     responsePrefix: '- ',
     needsFullDocument: true,
     buildPrompt: (_input, context) => ({
@@ -447,6 +486,7 @@ export const AI_ACTIONS: Record<string, AIActionDef> = {
     maxTokens: 1500,
     temperature: 0.3,
     stop: ['<|im_end|>'],
+    loraTask: 'rewrite_grammar',
     needsFullDocument: true,
     buildPrompt: (_input, context) => ({
       system:
@@ -469,6 +509,7 @@ export const AI_ACTIONS: Record<string, AIActionDef> = {
     maxTokens: 1500,
     temperature: 0.2,
     stop: ['<|im_end|>'],
+    loraTask: 'rewrite_grammar',
     needsFullDocument: true,
     buildPrompt: (_input, context) => ({
       system:
@@ -491,6 +532,7 @@ export const AI_ACTIONS: Record<string, AIActionDef> = {
     maxTokens: 60,
     temperature: 0.6,
     stop: ['<|im_end|>', '\n'],
+    loraTask: 'doc_creative',
     needsFullDocument: true,
     useOutlineContext: true,
     buildPrompt: (_input, context) => ({
@@ -510,6 +552,7 @@ export const AI_ACTIONS: Record<string, AIActionDef> = {
     maxTokens: 400,
     temperature: 0.5,
     stop: ['<|im_end|>'],
+    loraTask: 'doc_creative',
     needsFullDocument: true,
     useOutlineContext: true,
     buildPrompt: (_input, context) => ({
@@ -529,6 +572,7 @@ export const AI_ACTIONS: Record<string, AIActionDef> = {
     maxTokens: 400,
     temperature: 0.5,
     stop: ['<|im_end|>'],
+    loraTask: 'doc_creative',
     needsFullDocument: true,
     useOutlineContext: true,
     buildPrompt: (_input, context) => ({

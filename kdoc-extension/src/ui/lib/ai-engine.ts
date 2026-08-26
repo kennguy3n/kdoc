@@ -26,6 +26,46 @@ export interface BackendStatus {
 
 const BACKEND_URL = 'http://127.0.0.1:9942'
 
+/**
+ * Base path for LoRA adapters in the kchat-ai-runtime manifest.
+ * Adapters live at: {LORA_BASE}/{family}.{lang}/adapters.safetensors
+ */
+const LORA_BASE = '/Users/Ken/workspaces/kocal/kchat-ai-runtime/manifest/packs/bonsai-1.7b-mlx-1bit/lora'
+
+/**
+ * Map KDoc language names (from translate action context) to LoRA language codes.
+ */
+const LANG_TO_LORA: Record<string, string> = {
+  Spanish: 'es',
+  French: 'fr',
+  German: 'de',
+  Japanese: 'ja',
+  Chinese: 'zh',
+  Vietnamese: 'vi',
+  Korean: 'ko',
+  Arabic: 'ar',
+  Hindi: 'hi',
+  English: 'en',
+}
+
+/**
+ * Resolve a LoRA adapter path from a task family and language context.
+ * For translation, the context is the target language name (e.g. "Chinese").
+ * For other tasks, we use the "en" adapter by default.
+ * Returns null if the path doesn't exist (caller should fall back to base model).
+ */
+function resolveLoraPath(loraTask: string, context?: string): string | null {
+  let langCode = 'en'
+
+  // For translate, context is the target language name.
+  if (loraTask === 'rewrite_grammar' && context) {
+    langCode = LANG_TO_LORA[context] ?? 'en'
+  }
+
+  const adapterPath = `${LORA_BASE}/${loraTask}.${langCode}`
+  return adapterPath
+}
+
 export class AIEngine {
   private loaded = false
   private loading = false
@@ -126,6 +166,41 @@ export class AIEngine {
     await fetch(`${BACKEND_URL}/api/unload`, {method: 'POST'})
     this.loaded = false
     this.currentModel = null
+    this.currentLoraAdapter = null
+  }
+
+  /** Current LoRA adapter path (null = base model only). */
+  private currentLoraAdapter: string | null = null
+
+  /** Load a LoRA adapter for a specific task+language. */
+  async loadLora(adapterPath: string): Promise<void> {
+    if (this.currentLoraAdapter === adapterPath) return
+    const resp = await fetch(`${BACKEND_URL}/api/lora/load`, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({adapter_path: adapterPath}),
+    })
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({error: 'Unknown error'}))
+      throw new Error(`LoRA load failed: ${err.error || `HTTP ${resp.status}`}`)
+    }
+    this.currentLoraAdapter = adapterPath
+  }
+
+  /** Detach the current LoRA adapter, reverting to base model. */
+  async detachLora(): Promise<void> {
+    if (!this.currentLoraAdapter) return
+    await fetch(`${BACKEND_URL}/api/lora/detach`, {method: 'POST'})
+    this.currentLoraAdapter = null
+  }
+
+  /** Get the current LoRA adapter path from the backend. */
+  async getLoraStatus(): Promise<string | null> {
+    const resp = await fetch(`${BACKEND_URL}/api/lora/status`)
+    if (!resp.ok) return null
+    const data = await resp.json()
+    this.currentLoraAdapter = data.adapter ?? null
+    return this.currentLoraAdapter
   }
 
   async runSkill(
@@ -139,11 +214,25 @@ export class AIEngine {
       return
     }
 
+    // Auto-load LoRA adapter if the skill specifies a task family.
+    if (skill.loraTask) {
+      const adapterPath = resolveLoraPath(skill.loraTask, context)
+      if (adapterPath) {
+        try {
+          await this.loadLora(adapterPath)
+        } catch (err) {
+          // Non-fatal: fall back to base model if LoRA load fails.
+          console.warn(`LoRA load failed for ${skill.loraTask}:`, err)
+        }
+      }
+    }
+
     // For selection-scope actions, input is the selection text.
     // For topic-scope actions, input is the context (which carries the topic).
     // For document-scope actions, input is empty (context is the document).
     const input = skill.scope === 'selection' ? selection : skill.scope === 'topic' ? (context ?? '') : ''
-    const {system, user} = skill.buildPrompt(input, context)
+    const {system, user, responsePrefix: dynamicPrefix} = skill.buildPrompt(input, context)
+    const responsePrefix = dynamicPrefix ?? skill.responsePrefix
 
     try {
       const resp = await fetch(`${BACKEND_URL}/api/chat`, {
@@ -155,7 +244,7 @@ export class AIEngine {
           max_tokens: skill.maxTokens,
           temperature: skill.temperature,
           stop: skill.stop,
-          response_prefix: skill.responsePrefix,
+          response_prefix: responsePrefix,
         }),
       })
 
