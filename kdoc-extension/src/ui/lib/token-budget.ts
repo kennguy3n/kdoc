@@ -1,24 +1,42 @@
 /**
  * Token budget estimation and context truncation utilities.
  *
- * The local model (Ternary-Bonsai-4B) has a 4096-token context window.
- * After ChatML template overhead (~100 tokens) and the think-tag pre-fill
- * (~10 tokens), roughly 3980 tokens are available for system + user + output.
+ * The local model (Ternary-Bonsai-1.7B) has an 8192-token context window
+ * (increased from 4096 to support document processing). After ChatML template
+ * overhead (~100 tokens) and the think-tag pre-fill (~10 tokens), roughly
+ * 8060 tokens are available for system + user + output.
  *
- * We use a conservative estimate of ~3 chars per token for English text.
- * The previous value of 4 chars/token was too optimistic and caused
- * document-scoped actions (improve_document, format_document) to silently
- * overflow the context window on moderately-sized documents.
+ * We use per-script chars-per-token ratios for accurate estimation:
+ * - Latin/Cyrillic: ~3 chars/token
+ * - CJK (Chinese/Japanese/Korean): ~1.0 chars/token
+ * - Arabic/Thai/Devanagari/Tamil/Bengali: ~1.5 chars/token
  */
 
-const CHARS_PER_TOKEN = 3
-const TOTAL_CONTEXT = 4096
+const CHARS_PER_TOKEN_LATIN = 3
+const CHARS_PER_TOKEN_CJK = 1.0
+const CHARS_PER_TOKEN_COMPLEX = 1.5
+const TOTAL_CONTEXT = 8192
 const TEMPLATE_OVERHEAD = 120 // ChatML tags + think-tag pre-fill
 const SAFETY_MARGIN = 80 // guard against estimation drift
 
-/** Estimate the token count of a string. Conservative (~3 chars/token). */
+/**
+ * Estimate the token count of a string using per-script chars-per-token ratios.
+ * CJK characters are ~1 char/token, Arabic/Thai/Devanagari ~1.5, Latin ~3.
+ */
 export function estimateTokens(text: string): number {
-  return Math.ceil(text.length / CHARS_PER_TOKEN)
+  // CJK: Chinese, Japanese Hiragana/Katakana, Korean Hangul
+  const cjkRe = /[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af\u3400-\u4dbf\uf900-\ufaff]/
+  // Complex scripts: Arabic, Thai, Devanagari, Tamil, Bengali
+  const complexRe = /[\u0600-\u06ff\u0750-\u077f\u0e00-\u0e7f\u0900-\u097f\u0b80-\u0bff\u0980-\u09ff]/
+
+  let cjk = 0
+  let complex = 0
+  for (const ch of text) {
+    if (cjkRe.test(ch)) cjk++
+    else if (complexRe.test(ch)) complex++
+  }
+  const latin = text.length - cjk - complex
+  return Math.ceil(cjk / CHARS_PER_TOKEN_CJK + complex / CHARS_PER_TOKEN_COMPLEX + latin / CHARS_PER_TOKEN_LATIN)
 }
 
 /**
@@ -42,7 +60,7 @@ export function budgetForContext(
   const wrapperTokens = estimateTokens(userWrapper)
   const remaining =
     totalCtx - TEMPLATE_OVERHEAD - SAFETY_MARGIN - systemTokens - wrapperTokens - maxOutputTokens
-  return Math.max(remaining * CHARS_PER_TOKEN, 0)
+  return Math.max(remaining * CHARS_PER_TOKEN_LATIN, 0)
 }
 
 /**

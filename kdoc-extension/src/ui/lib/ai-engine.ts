@@ -2,6 +2,84 @@ import type {AIActionDef} from './ai-actions'
 
 export type ModelLoadProgress = (progress: number) => void
 
+/**
+ * Patterns that indicate model artifacts leaking into output.
+ * These are stripped from the token stream before reaching the UI.
+ */
+const ARTIFACT_PATTERNS: RegExp[] = [
+  // System prompt injection echoes — full patterns
+  /!systemmessage[^\n]*/gi,
+  /!systemend[^\n]*/gi,
+  /!systemerror[^\n]*/gi,
+  // Fragment patterns — when !systemmessage is split across tokens,
+  // sanitization may catch "!system" in one token and leave "message" behind.
+  // Catch the fragment "!message" and "!end" as standalone artifacts.
+  /!message(?=\s|$)/gi,
+  /!end(?=\s|$)/gi,
+  // Meta-commentary the model produces about its own task
+  /The text has been improved for clarity and flow[^\n]*/gi,
+  /The text has been improved[^\n]*/gi,
+  /The text has been rewritten[^\n]*/gi,
+  /The document has been processed[^\n]*/gi,
+  /The document has been improved[^\n]*/gi,
+  /Improved text format[^\n]*/gi,
+  /Improve the text for clarity and flow[^\n]*/gi,
+  /Keep the meaning[^\n]*Output only the improved text[^\n]*/gi,
+  /Output only the improved text[^\n]*/gi,
+  /Output only the (?:formatted|corrected|simplified|expanded|shortened|translated) text[^\n]*/gi,
+  /Output ONLY the (?:improved|formatted|corrected|simplified|expanded|shortened|translated) version[^\n]*/gi,
+  /Do NOT include the document title[^\n]*/gi,
+  /Do NOT repeat content[^\n]*/gi,
+  /You are processing section[^\n]*/gi,
+  // ChatML tag leakage
+  /<\|im_start\|>/g,
+  /<\|im_end\|>/g,
+  // Think tag leakage (should be filtered by backend but catch residual)
+  /<think>/g,
+  /<\/think>/g,
+  // Cut-off marker
+  /\[CUT_OFF\]/g,
+  // "System message:" meta-commentary
+  /System message:[^\n]*/gi,
+  // Repeated standalone "system" lines (ChatML tag leakage where <|im_start|>system
+  // gets stripped but "system" remains). Only strip when it appears as a
+  // standalone line, not as part of a word like "systematic".
+  /^system$/gim,
+  // Repeated "system" at end of output (model stuck in a loop)
+  /(?:^|\n)system(?:\n|$){2,}/g,
+  // "message excluded" — model echoing prompt instructions about what to
+  // exclude from output. Appears in table cells as "(message excluded)".
+  /\(message excluded\)/gi,
+  // "The improved version is now ready" — meta-commentary
+  /The improved version is now ready[^\n]*/gi,
+]
+
+/**
+ * Sanitize a token (or accumulated output) by stripping known artifacts.
+ * Called on each token in the streaming path.
+ */
+function sanitizeToken(token: string): string {
+  let result = token
+  for (const pattern of ARTIFACT_PATTERNS) {
+    result = result.replace(pattern, '')
+  }
+  return result
+}
+
+/**
+ * Sanitize the final accumulated output. Handles artifacts that may span
+ * multiple tokens (and thus weren't caught by per-token sanitization).
+ */
+function sanitizeOutput(text: string): string {
+  let result = text
+  for (const pattern of ARTIFACT_PATTERNS) {
+    result = result.replace(pattern, '')
+  }
+  // Clean up extra blank lines left by artifact removal
+  result = result.replace(/\n{3,}/g, '\n\n')
+  return result.trim()
+}
+
 export interface AIEngineCallbacks {
   onToken: (token: string) => void
   onDone: () => void
@@ -22,15 +100,30 @@ export interface BackendStatus {
   model_name: string | null
   model_format: string | null
   backend: string
+  /** Current model quality mode ("fast" | "quality"). */
+  model_quality?: string
 }
+
+/**
+ * Model quality preference — determines which Bonsai quantization to load.
+ * - "fast": 1-bit Bonsai (~269MB, ~22 tok/s, lower quality)
+ * - "quality": 2-bit Ternary Bonsai (~484MB, ~11 tok/s, +18% benchmark score)
+ *
+ * Both models share the same Qwen3-1.7B architecture and LoRA adapters.
+ */
+export type ModelQuality = 'fast' | 'quality'
 
 const BACKEND_URL = 'http://127.0.0.1:9942'
 
 /**
- * Base path for LoRA adapters in the kchat-ai-runtime manifest.
+ * Base paths for LoRA adapters in the kchat-ai-runtime manifest.
  * Adapters live at: {LORA_BASE}/{family}.{lang}/adapters.safetensors
+ *
+ * Both the 1-bit and 2-bit MLX packs symlink their `lora/` directory to the
+ * same shared adapter set, so either base path resolves to the same files.
  */
-const LORA_BASE = '/Users/Ken/workspaces/kocal/kchat-ai-runtime/manifest/packs/bonsai-1.7b-mlx-1bit/lora'
+const LORA_BASE_1BIT = '/Users/Ken/workspaces/kocal/kchat-ai-runtime/manifest/packs/bonsai-1.7b-mlx-1bit/lora'
+const LORA_BASE_2BIT = '/Users/Ken/workspaces/kocal/kchat-ai-runtime/manifest/packs/ternary-bonsai-1.7b-mlx-2bit/lora'
 
 /**
  * Map KDoc language names (from translate action context) to LoRA language codes.
@@ -49,12 +142,16 @@ const LANG_TO_LORA: Record<string, string> = {
 }
 
 /**
- * Resolve a LoRA adapter path from a task family and language context.
+ * Resolve a LoRA adapter path from a task family, language context, and quality mode.
  * For translation, the context is the target language name (e.g. "Chinese").
  * For other tasks, we use the "en" adapter by default.
  * Returns null if the path doesn't exist (caller should fall back to base model).
+ *
+ * Quality mode selects the adapter set:
+ * - "fast": 1-bit dedicated LoRA adapters (trained on 1-bit base)
+ * - "quality": 2-bit dedicated LoRA adapters (trained on 2-bit base)
  */
-function resolveLoraPath(loraTask: string, context?: string): string | null {
+function resolveLoraPath(loraTask: string, quality: ModelQuality, context?: string): string | null {
   let langCode = 'en'
 
   // For translate, context is the target language name.
@@ -62,7 +159,9 @@ function resolveLoraPath(loraTask: string, context?: string): string | null {
     langCode = LANG_TO_LORA[context] ?? 'en'
   }
 
-  const adapterPath = `${LORA_BASE}/${loraTask}.${langCode}`
+  // Use the adapter set matching the current quality mode.
+  const basePath = quality === 'quality' ? LORA_BASE_2BIT : LORA_BASE_1BIT
+  const adapterPath = `${basePath}/${loraTask}.${langCode}`
   return adapterPath
 }
 
@@ -71,6 +170,8 @@ export class AIEngine {
   private loading = false
   private loadProgress = 0
   private currentModel: string | null = null
+  /** Current model quality mode. */
+  private quality: ModelQuality = 'fast'
 
   isLoaded(): boolean {
     return this.loaded
@@ -86,6 +187,62 @@ export class AIEngine {
 
   getModelName(): string | null {
     return this.currentModel
+  }
+
+  /** Get the current model quality mode. */
+  getQuality(): ModelQuality {
+    return this.quality
+  }
+
+  /** Set the model quality mode (does not reload — call reloadForQuality to switch). */
+  setQuality(q: ModelQuality): void {
+    this.quality = q
+  }
+
+  /** Get the current quality mode from the backend. */
+  async fetchQuality(): Promise<ModelQuality> {
+    try {
+      const resp = await fetch(`${BACKEND_URL}/api/quality`)
+      if (!resp.ok) return this.quality
+      const data = await resp.json()
+      const q = data.quality as string
+      if (q === 'quality' || q === 'fast') {
+        this.quality = q as ModelQuality
+      }
+    } catch {
+      // Backend not running — keep current setting.
+    }
+    return this.quality
+  }
+
+  /** Set the quality mode on the backend (no model reload). */
+  async setBackendQuality(q: ModelQuality): Promise<void> {
+    await fetch(`${BACKEND_URL}/api/quality`, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({quality: q}),
+    })
+    this.quality = q
+  }
+
+  /**
+   * Switch model quality and reload the appropriate model pack.
+   * Unloads the current model, sets the new quality, and auto-loads the new pack.
+   */
+  async switchQuality(q: ModelQuality, onProgress?: ModelLoadProgress): Promise<void> {
+    if (this.quality === q && this.loaded) return
+    this.quality = q
+
+    // Unload current model first.
+    if (this.loaded) {
+      await this.unloadModel()
+    }
+
+    // Set quality on backend so auto-load picks the right pack.
+    await this.setBackendQuality(q)
+
+    // Auto-load the new model.
+    await this.autoLoadModel(onProgress)
   }
 
   async getStatus(): Promise<BackendStatus> {
@@ -215,8 +372,13 @@ export class AIEngine {
     }
 
     // Auto-load LoRA adapter if the skill specifies a task family.
+    // If the skill has no loraTask, detach any currently-loaded LoRA so
+    // the base model is used. Without this, a LoRA from a previous action
+    // (e.g. rewrite_grammar from improve_writing) stays attached and
+    // corrupts the output of actions that expect the base model (e.g.
+    // improve_document, format_document).
     if (skill.loraTask) {
-      const adapterPath = resolveLoraPath(skill.loraTask, context)
+      const adapterPath = resolveLoraPath(skill.loraTask, this.quality, context)
       if (adapterPath) {
         try {
           await this.loadLora(adapterPath)
@@ -225,6 +387,9 @@ export class AIEngine {
           console.warn(`LoRA load failed for ${skill.loraTask}:`, err)
         }
       }
+    } else {
+      // No LoRA needed for this skill — ensure base model is active.
+      await this.detachLora()
     }
 
     // For selection-scope actions, input is the selection text.
@@ -290,9 +455,12 @@ export class AIEngine {
                 callbacks.onCutOff?.()
                 continue
               }
-              callbacks.onToken(token)
+              // Sanitize artifacts from the token before forwarding to UI
+              const clean = sanitizeToken(token)
+              if (clean) callbacks.onToken(clean)
             } catch {
-              callbacks.onToken(raw)
+              const clean = sanitizeToken(raw)
+              if (clean) callbacks.onToken(clean)
             }
           }
         }

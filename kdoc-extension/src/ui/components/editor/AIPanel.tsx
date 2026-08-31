@@ -4,7 +4,7 @@ import {
   Sparkles,
   X,
 } from 'lucide-react'
-import { useCallback, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 
 import {
   ACTIONS_BY_GROUP,
@@ -14,7 +14,7 @@ import {
   type AIActionDef,
   type AIActionGroup,
 } from '@/ui/lib/ai-actions'
-import { getAIEngine } from '@/ui/lib/ai-engine'
+import { getAIEngine, type ModelQuality } from '@/ui/lib/ai-engine'
 import { ACTION_ICONS, DEFAULT_ACTION_ICON } from '@/ui/lib/ai-icons'
 import { chunkDocument, extractOutlineContext } from '@/ui/lib/doc-chunking'
 import { adaptiveMaxOutput, budgetForContext, truncateContext } from '@/ui/lib/token-budget'
@@ -151,6 +151,18 @@ function looksCutOff(chunk: string, maxTokens: number): boolean {
   if (chunk.endsWith('\n\n')) return false
   // Otherwise, if we used >60% of the budget, assume cut off.
   return true
+}
+
+/**
+ * Check if a document transformation output is suspiciously short relative
+ * to the input — indicates the model summarized instead of transforming.
+ * This catches cases where the model produces a "complete" but inadequate
+ * response (e.g., 12% of input length when asked to improve a document).
+ */
+function outputTooShort(output: string, input: string): boolean {
+  // Only flag if output is less than 40% of input length.
+  // Improvement may condense slightly, but losing >60% of content is wrong.
+  return output.trim().length < input.trim().length * 0.4
 }
 
 /**
@@ -395,35 +407,86 @@ async function runChunkedTransform(
   onDone: () => void,
   onError: (err: string) => void,
   onProgress?: (chunk: number, total: number) => void,
+  /** Override the max chunk size (chars). Defaults to adaptive sizing. */
+  maxChunkSizeOverride?: number,
 ): Promise<void> {
   const outline = extractOutline(documentText)
-  const outlineLine = outline ? `\nDocument outline (for context):\n${outline}\n` : ''
 
-  // Adaptively size chunks based on outline length so the full request
-  // (system + outline + chunk + maxTokens + overhead) fits in 4096 tokens.
-  // Base chunk size is 6000 chars; reduce it if the outline is large.
-  const chunkInfoOverhead = 80 // "You are processing chunk N of M..." line
-  const fullSystemOverhead = system.length + outlineLine.length + chunkInfoOverhead
-  const maxChunkChars = Math.max(
+  // Adaptively size chunks based on the LoRA's training distribution.
+  // The LoRA adapters were trained on max_seq=1024 tokens (~3000 chars)
+  // with median training text ~300 tokens. Chunks larger than the training
+  // distribution cause the model to summarize instead of transform.
+  // Cap at 3000 chars to stay within the LoRA's effective range.
+  const chunkInfoOverhead = 80
+  const fullSystemOverhead = system.length + chunkInfoOverhead
+  const adaptiveChunkChars = Math.max(
     2000,
-    Math.min(6000, (4096 - 120 - 80 - maxTokens) * 3 - fullSystemOverhead - 100),
+    Math.min(12000, (8192 - 120 - 80 - maxTokens) * 3 - fullSystemOverhead - 100),
   )
+  const LORA_TRAINING_CHUNK_CAP = 1500
+  const maxChunkChars = maxChunkSizeOverride ?? Math.min(adaptiveChunkChars, LORA_TRAINING_CHUNK_CAP)
   const chunks = chunkDocument(documentText, maxChunkChars)
+
+  // Track the tail of each chunk's output to provide continuity context
+  // to the next chunk. This prevents inconsistent formatting between sections.
+  let prevChunkTail = ''
 
   for (let i = 0; i < chunks.length; i++) {
     const chunk = chunks[i]
     onProgress?.(i + 1, chunks.length)
 
+    // Extract tables from the chunk before sending to the model. The 1.7B
+    // model with rewrite_grammar LoRA drops tables when asked to "improve"
+    // text. We replace tables with placeholders, let the model improve the
+    // prose, then re-insert the original tables afterward.
+    const tablePlaceholders: string[] = []
+    let chunkTextForModel = chunk.text.replace(
+      /(\|[^\n]+\|\n)(\|[-:\s|]+\|\n)((?:\|[^\n]+\|\n?)+)/g,
+      (_match, header, separator, rows) => {
+        const table = header + separator + rows
+        const placeholder = `[TABLE_${tablePlaceholders.length}]`
+        tablePlaceholders.push(table.trimEnd())
+        return placeholder + '\n'
+      },
+    )
+
+    // Extract ALL headings in this chunk (not just the first one) so the
+    // model knows exactly which sections to output. Without this, the model
+    // may skip sections that appear later in the chunk (especially tables).
+    const chunkHeadings = chunkTextForModel.match(/^#{1,6}\s+.+/gm) ?? []
+    const headingMatch = chunkTextForModel.match(/^#{1,6}\s+(.+)/m)
+    const sectionName = headingMatch ? headingMatch[1].trim() : `chunk ${i + 1}`
+    const headingList = chunkHeadings.length > 1
+      ? `\nThis chunk contains ${chunkHeadings.length} sections: ${chunkHeadings.map(h => h.replace(/^#{1,6}\s+/, '')).join(', ')}. Output ALL of them.`
+      : ''
+
+    const continuityContext = prevChunkTail
+      ? `\nPrevious section ended with:\n"""\n${prevChunkTail}\n"""\nContinue from this point. Do NOT repeat any content.`
+      : ''
+
+    // Key: do NOT include the full outline — it causes the model to regenerate
+    // the entire document instead of just the current section.
+    // Instead, just tell it which section this is and that it should only
+    // output the improved version of THIS section.
+    const tableInstruction = tablePlaceholders.length > 0
+      ? `\nThis section contains ${tablePlaceholders.length} table(s), shown as [TABLE_N] placeholders. Keep the placeholders in your output exactly where they appear. Do NOT remove or modify them.`
+      : ''
     const chunkSystem =
       system +
-      (outlineLine ? `\n${outlineLine}` : '') +
-      `\nYou are processing chunk ${i + 1} of ${chunks.length}. ` +
-      `Preserve formatting consistency with the rest of the document.`
-    const chunkUser = `Process this section:\n\n${chunk.text}`
+      `\nYou are processing section ${i + 1} of ${chunks.length}: "${sectionName}". ` +
+      `Output ONLY the improved version of this section. ` +
+      `Do NOT include the document title, other sections, or any content not in this section. ` +
+      `Do NOT repeat content from other sections.` +
+      `\nPreserve ALL lists and formatting. Do NOT skip any content.` +
+      headingList +
+      tableInstruction +
+      continuityContext
+    const chunkUser = `Improve this section:\n\n<document>\n${chunkTextForModel}\n</document>`
 
     // Per-chunk adaptive maxTokens as a safety net.
     const chunkMaxTokens = adaptiveMaxOutput(chunkSystem, chunk.text, maxTokens, chunkUser)
 
+    let chunkOutput = ''
     let chunkFailed = false
     await new Promise<void>((resolve, reject) => {
       engine.runSkill(
@@ -443,7 +506,10 @@ async function runChunkedTransform(
         '',
         '',
         {
-          onToken: (token) => onToken(token),
+          onToken: (token) => {
+            chunkOutput += token
+            onToken(token)
+          },
           onDone: resolve,
           onError: (err) => reject(new Error(err)),
         },
@@ -455,6 +521,30 @@ async function runChunkedTransform(
 
     if (chunkFailed) return
 
+    // Detect repetition loops — if the same 100-char block appears 3+ times,
+    // truncate the output at the first repetition. This prevents degenerate
+    // output where the model gets stuck repeating the same content.
+    chunkOutput = truncateRepetition(chunkOutput)
+
+    // Re-insert tables that were extracted before model generation.
+    // The model was given [TABLE_N] placeholders; replace them with the
+    // original table content. If the model dropped a placeholder, append
+    // the table at the end of the chunk output.
+    if (tablePlaceholders.length > 0) {
+      for (let t = 0; t < tablePlaceholders.length; t++) {
+        const placeholder = `[TABLE_${t}]`
+        if (chunkOutput.includes(placeholder)) {
+          chunkOutput = chunkOutput.replace(placeholder, tablePlaceholders[t])
+        } else {
+          // Model dropped the placeholder — append the table at the end
+          chunkOutput += '\n\n' + tablePlaceholders[t]
+        }
+      }
+    }
+
+    // Save the last 300 chars of this chunk's output for the next chunk's context.
+    prevChunkTail = chunkOutput.slice(-300)
+
     // Add spacing between chunks in the stitched output.
     if (i < chunks.length - 1) {
       onToken('\n\n')
@@ -462,6 +552,35 @@ async function runChunkedTransform(
   }
 
   onDone()
+}
+
+/**
+ * Detect and truncate repetition loops in generated text.
+ * If the same 80+ character block appears 3+ times, keep only the first
+ * occurrence. This prevents degenerate output from small models.
+ */
+function truncateRepetition(text: string): string {
+  // Look for 80-char blocks that repeat 3+ times.
+  // Keep the first occurrence, truncate before the second.
+  const minBlock = 80
+  if (text.length < minBlock * 3) return text
+
+  for (let i = 0; i < text.length - minBlock * 3; i++) {
+    const block = text.slice(i, i + minBlock)
+    // Count occurrences of this block
+    let count = 0
+    let pos = text.indexOf(block, i + minBlock)
+    while (pos !== -1) {
+      count++
+      pos = text.indexOf(block, pos + minBlock)
+    }
+    if (count >= 2) {
+      // Found repetition — keep up to the second occurrence (first repeat)
+      const secondPos = text.indexOf(block, i + minBlock)
+      return text.slice(0, secondPos).trimEnd()
+    }
+  }
+  return text
 }
 
 /**
@@ -485,7 +604,7 @@ async function runMapReduce(
   onError: (err: string) => void,
   onProgress?: (phase: 'map' | 'reduce', current: number, total: number) => void,
 ): Promise<void> {
-  const chunks = chunkDocument(documentText, 6000)
+  const chunks = chunkDocument(documentText, 12000)
 
   // Phase 1 (map): summarize each chunk into bullet points.
   const chunkSummaries: string[] = []
@@ -641,7 +760,33 @@ export function AIPanel({ editor, open, onClose }: AIPanelProps) {
   const [output, setOutput] = useState('')
   const [status, setStatus] = useState<'idle' | 'streaming' | 'done' | 'error'>('idle')
   const [continuationRound, setContinuationRound] = useState(0)
+  const [quality, setQuality] = useState<ModelQuality>('fast')
+  const [switching, setSwitching] = useState(false)
   const outputRef = useRef<HTMLDivElement>(null)
+  const rawOutputRef = useRef<string>('')
+
+  // Sync quality from backend on mount.
+  useEffect(() => {
+    getAIEngine().fetchQuality().then(setQuality).catch(() => {})
+  }, [])
+
+  const handleSwitchQuality = useCallback(async (q: ModelQuality) => {
+    if (q === quality || switching) return
+    setSwitching(true)
+    setStatus('idle')
+    setOutput('')
+    rawOutputRef.current = ''
+    try {
+      const engine = getAIEngine()
+      await engine.switchQuality(q)
+      setQuality(q)
+    } catch (err) {
+      setStatus('error')
+      setOutput(err instanceof Error ? err.message : String(err))
+    } finally {
+      setSwitching(false)
+    }
+  }, [quality, switching])
 
   const handleRun = useCallback(
     async (action: AIActionDef) => {
@@ -706,10 +851,20 @@ export function AIPanel({ editor, open, onClose }: AIPanelProps) {
       // For full-document transform actions, check if the doc needs chunking.
       // If it fits in the context budget, use the single-pass path. If not,
       // use chunked transform (improve/format) or map-reduce (summarize).
+      // Additionally, for improve/format_document, chunk even when the doc
+      // fits in context if it's >4000 chars — the LoRA was trained on short
+      // texts (median ~300 tokens, max_seq 1024) and produces poor results
+      // (summarization instead of improvement) on long single-pass inputs.
+      // Threshold is 2000 chars (~670 tokens) — above the LoRA's median training
+      // text length but within its max_seq. This ensures chunking kicks in
+      // before the model starts losing content.
+      const isTransformAction = action.id === 'improve_document' || action.id === 'format_document'
+      const transformChunkThreshold = 2000 // chars; above this, chunk even if context fits
       const needsChunking =
         action.needsFullDocument &&
         !action.useOutlineContext &&
-        rawText.length > maxContextChars
+        (rawText.length > maxContextChars ||
+          (isTransformAction && rawText.length > transformChunkThreshold))
 
       // For the chunked/map-reduce paths, we pass the full untruncated text
       // to the strategy function. For the single-pass path, truncate.
@@ -814,11 +969,16 @@ export function AIPanel({ editor, open, onClose }: AIPanelProps) {
           },
         )
       } else if ((action.id === 'improve_document' || action.id === 'format_document') && needsChunking) {
+        // Cap per-chunk output tokens at 1024 — matching the LoRA's max_seq_length.
+        // The LoRA was trained on max_seq=1024, so outputs beyond this length
+        // degrade in quality. The chunked approach stitches multiple chunks
+        // together to cover the full document.
+        const chunkMaxTokens = Math.min(effectiveMaxTokens, 1024)
         await runChunkedTransform(
           engine,
           system,
           context,
-          effectiveMaxTokens,
+          chunkMaxTokens,
           action.temperature,
           action.stop,
           (token) => {
@@ -866,6 +1026,9 @@ export function AIPanel({ editor, open, onClose }: AIPanelProps) {
           responsePrefix,
         )
       } else {
+        // For actions with postProcess (e.g. extract_actions), accumulate
+        // raw output and apply postProcess on completion.
+        const hasPostProcess = !!action.postProcess
         await engine.runSkill(
           {
             id: action.id,
@@ -885,12 +1048,19 @@ export function AIPanel({ editor, open, onClose }: AIPanelProps) {
           context,
           {
             onToken: (token) => {
+              if (hasPostProcess) rawOutputRef.current += token
               setOutput((prev) => prev + token)
               if (outputRef.current) {
                 outputRef.current.scrollTop = outputRef.current.scrollHeight
               }
             },
-            onDone: () => setStatus('done'),
+            onDone: () => {
+              if (hasPostProcess && action.postProcess) {
+                const processed = action.postProcess(rawOutputRef.current)
+                setOutput(processed)
+              }
+              setStatus('done')
+            },
             onError: (err) => {
               setStatus('error')
               setOutput(err)
@@ -932,6 +1102,44 @@ export function AIPanel({ editor, open, onClose }: AIPanelProps) {
         >
           <X className="h-3.5 w-3.5" />
         </button>
+      </div>
+
+      {/* Model quality toggle: Fast (1-bit) vs Quality (2-bit) */}
+      <div className="border-border flex items-center gap-1 border-b px-3 py-1.5">
+        <span className="text-muted text-xs">Model:</span>
+        <div className="flex rounded-md border border-border text-xs">
+          <button
+            type="button"
+            onClick={() => handleSwitchQuality('fast')}
+            disabled={switching}
+            className={cn(
+              'px-2 py-0.5 transition-colors',
+              quality === 'fast'
+                ? 'bg-brand text-surface font-medium'
+                : 'text-muted hover:bg-surface-2 hover:text-fg',
+              switching && 'opacity-50',
+            )}
+            title="1-bit Bonsai (~269MB, ~22 tok/s, faster)"
+          >
+            Fast
+          </button>
+          <button
+            type="button"
+            onClick={() => handleSwitchQuality('quality')}
+            disabled={switching}
+            className={cn(
+              'px-2 py-0.5 transition-colors',
+              quality === 'quality'
+                ? 'bg-brand text-surface font-medium'
+                : 'text-muted hover:bg-surface-2 hover:text-fg',
+              switching && 'opacity-50',
+            )}
+            title="2-bit Ternary Bonsai (~484MB, ~11 tok/s, higher quality)"
+          >
+            Quality
+          </button>
+        </div>
+        {switching && <Loader2 className="text-muted h-3 w-3 animate-spin" />}
       </div>
 
       <div className="flex-1 overflow-y-auto p-3">

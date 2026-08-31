@@ -23,11 +23,23 @@ use model_loader::ModelLoader;
 struct AppState {
     loader: Arc<RwLock<ModelLoader>>,
     model_dir: PathBuf,
+    /// Current model quality preference: "fast" (1-bit) or "quality" (2-bit).
+    quality: Arc<RwLock<String>>,
 }
 
 #[derive(Deserialize)]
 struct LoadRequest {
     model_path: String,
+}
+
+#[derive(Deserialize)]
+struct QualityRequest {
+    quality: String,
+}
+
+#[derive(Serialize)]
+struct QualityResponse {
+    quality: String,
 }
 
 #[derive(Deserialize)]
@@ -47,6 +59,8 @@ struct StatusResponse {
     model_format: Option<String>,
     backend: String,
     lora_adapter: Option<String>,
+    /// Current model quality mode ("fast" or "quality").
+    model_quality: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -128,12 +142,14 @@ async fn list_models(State(state): State<AppState>) -> impl IntoResponse {
 
 async fn get_status(State(state): State<AppState>) -> impl IntoResponse {
     let loader = state.loader.read().await;
+    let quality = state.quality.read().await.clone();
     Json(StatusResponse {
         loaded: loader.is_loaded(),
         model_name: loader.model_name().map(|s| s.to_string()),
         model_format: loader.model_format().map(|s| s.to_string()),
         backend: loader.backend_name().to_string(),
         lora_adapter: loader.lora_adapter().map(|s| s.to_string()),
+        model_quality: Some(quality),
     })
 }
 
@@ -180,13 +196,22 @@ async fn auto_load_model(
     State(state): State<AppState>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     let mlx_packs = find_mlx_packs(&state.model_dir);
+    let quality = state.quality.read().await.clone();
 
-    // Prefer the bonsai-1.7b-mlx-1bit pack if available
+    // Select model pack based on quality preference.
+    // "quality" → prefer 2-bit (ternary-bonsai-1.7b-mlx-2bit or bonsai-1.7b-mlx-2bit)
+    // "fast" (default) → prefer 1-bit (bonsai-1.7b-mlx-1bit)
+    let preferred_substring = if quality == "quality" {
+        "mlx-2bit"
+    } else {
+        "mlx-1bit"
+    };
+
     let model_path = mlx_packs
         .iter()
         .find(|p| {
             p.file_name()
-                .map(|n| n.to_string_lossy().contains("bonsai-1.7b-mlx-1bit"))
+                .map(|n| n.to_string_lossy().contains(preferred_substring))
                 .unwrap_or(false)
         })
         .or_else(|| mlx_packs.first());
@@ -207,6 +232,7 @@ async fn auto_load_model(
             "status": "loaded",
             "model_path": model_path.to_string_lossy(),
             "format": "mlx",
+            "quality": quality,
         }))),
         Err(e) => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -215,6 +241,33 @@ async fn auto_load_model(
             }),
         )),
     }
+}
+
+/// Get the current model quality setting.
+async fn get_quality(State(state): State<AppState>) -> impl IntoResponse {
+    let quality = state.quality.read().await.clone();
+    Json(QualityResponse { quality })
+}
+
+/// Set the model quality preference ("fast" or "quality").
+/// This does NOT reload the model — call /api/auto-load after switching
+/// to load the new model pack.
+async fn set_quality(
+    State(state): State<AppState>,
+    Json(req): Json<QualityRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let q = req.quality.trim().to_lowercase();
+    if q != "fast" && q != "quality" {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: format!("Invalid quality '{}': must be 'fast' or 'quality'", q),
+            }),
+        ));
+    }
+    *state.quality.write().await = q.clone();
+    tracing::info!("Model quality set to: {}", q);
+    Ok(Json(QualityResponse { quality: q }))
 }
 
 async fn chat(
@@ -355,9 +408,14 @@ async fn main() {
 
     tracing::info!("Model directory: {}", model_dir.display());
 
+    // Read initial quality from env var (default: fast)
+    let initial_quality = std::env::var("KDOC_MODEL_QUALITY")
+        .unwrap_or_else(|_| "fast".to_string());
+
     let state = AppState {
         loader: Arc::new(RwLock::new(ModelLoader::new())),
         model_dir,
+        quality: Arc::new(RwLock::new(initial_quality)),
     };
 
     let app = Router::new()
@@ -370,6 +428,7 @@ async fn main() {
         .route("/api/lora/load", post(load_lora))
         .route("/api/lora/detach", post(detach_lora))
         .route("/api/lora/status", get(lora_status))
+        .route("/api/quality", get(get_quality).post(set_quality))
         .layer(CorsLayer::permissive())
         .with_state(state);
 

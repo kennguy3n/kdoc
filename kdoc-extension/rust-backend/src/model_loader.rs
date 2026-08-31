@@ -27,7 +27,7 @@ impl ModelLoader {
             backend: Arc::new(MlxBackend::new()),
             model_name: None,
             model_format: None,
-            ctx_size: 4096,
+            ctx_size: 8192,
             lora_adapter: None,
         }
     }
@@ -80,8 +80,8 @@ impl ModelLoader {
 
         self.unload().await;
 
-        let ctx_size = env_or("KDOC_CTX_SIZE", "2048");
-        let ctx_size_val: u32 = ctx_size.parse().unwrap_or(2048);
+        let ctx_size = env_or("KDOC_CTX_SIZE", "8192");
+        let ctx_size_val: u32 = ctx_size.parse().unwrap_or(8192);
 
         let config = BackendConfig {
             backend_type: BackendType::Mlx,
@@ -94,6 +94,7 @@ impl ModelLoader {
             context_size: ctx_size_val as usize,
             threads: 4,
             batch_size: 512,
+            model_quality: kchat_generation::backend::ModelQuality::Fast,
         };
 
         // BackendAdapter::load is sync; wrap in spawn_blocking.

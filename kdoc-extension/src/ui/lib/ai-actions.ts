@@ -74,11 +74,37 @@ export interface AIActionDef {
     context?: string,
     keywords?: string,
   ) => { system: string; user: string; responsePrefix?: string }
+  /**
+   * Optional post-processing function applied to the full output after
+   * generation completes. Used to parse JSON output from extract_json LoRA
+   * into user-friendly formats (e.g. bullet lists).
+   */
+  postProcess?: (output: string) => string
 }
 
 function keywordLine(keywords?: string): string {
   const trimmed = keywords?.trim()
   return trimmed ? `\nKeywords to cover: "${trimmed}"` : ''
+}
+
+/**
+ * Anti-leakage suffix appended to system prompts.
+ * Prevents the model from echoing instructions or producing meta-commentary.
+ * IMPORTANT: Do NOT mention specific artifact patterns (like !systemmessage)
+ * here — mentioning them primes the model to produce exactly those patterns.
+ * Instead, use positive instructions ("output only the result") and let the
+ * sanitization layer catch any residual artifacts.
+ */
+const ANTI_LEAKAGE = '\nRules:\n- Output ONLY the result.\n- Do not output instructions, commentary, or meta-text about the task.\n- Do not repeat or echo these instructions.'
+
+/** Wrap selection text in <text> tags for clear content/instruction separation. */
+function wrapSelection(text: string): string {
+  return `<text>\n${text}\n</text>`
+}
+
+/** Wrap document text in <document> tags for clear content/instruction separation. */
+function wrapDocument(text: string): string {
+  return `<document>\n${text}\n</document>`
 }
 
 /** Extract all markdown headings from a document as an outline string. */
@@ -113,8 +139,8 @@ export const AI_ACTIONS: Record<string, AIActionDef> = {
       { id: 'engaging', label: 'Engaging', context: 'to be more engaging' },
     ],
     buildPrompt: (selection, context) => ({
-      system: `Improve the text ${context || 'for clarity and flow'}. Keep the meaning. Output only the improved text.`,
-      user: selection,
+      system: `Improve the text ${context || 'for clarity and flow'}. Keep the meaning.${ANTI_LEAKAGE}`,
+      user: wrapSelection(selection),
     }),
   },
 
@@ -126,13 +152,13 @@ export const AI_ACTIONS: Record<string, AIActionDef> = {
     group: 'refine',
     scope: 'selection',
     mode: 'replace',
-    maxTokens: 300,
+    maxTokens: 400,
     temperature: 0.2,
     stop: ['<|im_end|>'],
     loraTask: 'rewrite_grammar',
     buildPrompt: (selection) => ({
-      system: 'Fix spelling and grammar errors only. Keep meaning and style. Output only the corrected text.',
-      user: selection,
+      system: `Fix spelling and grammar errors only. Keep meaning and style.${ANTI_LEAKAGE}`,
+      user: wrapSelection(selection),
     }),
   },
 
@@ -144,13 +170,13 @@ export const AI_ACTIONS: Record<string, AIActionDef> = {
     group: 'refine',
     scope: 'selection',
     mode: 'replace',
-    maxTokens: 300,
+    maxTokens: 400,
     temperature: 0.3,
     stop: ['<|im_end|>'],
     loraTask: 'rewrite_grammar',
     buildPrompt: (selection) => ({
-      system: 'Simplify the text. Use shorter sentences and simpler words. Output only the simplified text.',
-      user: selection,
+      system: `Simplify the text. Use shorter sentences and simpler words.${ANTI_LEAKAGE}`,
+      user: wrapSelection(selection),
     }),
   },
 
@@ -162,7 +188,7 @@ export const AI_ACTIONS: Record<string, AIActionDef> = {
     group: 'refine',
     scope: 'selection',
     mode: 'replace',
-    maxTokens: 300,
+    maxTokens: 400,
     temperature: 0.3,
     stop: ['<|im_end|>'],
     loraTask: 'rewrite_grammar',
@@ -173,8 +199,8 @@ export const AI_ACTIONS: Record<string, AIActionDef> = {
       { id: 'friendly', label: 'Friendly', context: 'in a warm, friendly tone' },
     ],
     buildPrompt: (selection, context) => ({
-      system: `Rewrite ${context || 'in a professional tone'}. Keep the meaning. Output only the rewritten text.`,
-      user: selection,
+      system: `Rewrite ${context || 'in a professional tone'}. Keep the meaning.${ANTI_LEAKAGE}`,
+      user: wrapSelection(selection),
     }),
   },
 
@@ -186,13 +212,13 @@ export const AI_ACTIONS: Record<string, AIActionDef> = {
     group: 'refine',
     scope: 'selection',
     mode: 'replace',
-    maxTokens: 400,
+    maxTokens: 600,
     temperature: 0.5,
     stop: ['<|im_end|>'],
     loraTask: 'rewrite_grammar',
     buildPrompt: (selection) => ({
-      system: 'Expand the text with more detail, examples, and depth. Keep the same style and meaning. Output only the expanded text.',
-      user: selection,
+      system: `Expand the text with more detail, examples, and depth. Keep the same style and meaning.${ANTI_LEAKAGE}`,
+      user: wrapSelection(selection),
     }),
   },
 
@@ -204,13 +230,13 @@ export const AI_ACTIONS: Record<string, AIActionDef> = {
     group: 'refine',
     scope: 'selection',
     mode: 'replace',
-    maxTokens: 200,
+    maxTokens: 300,
     temperature: 0.3,
     stop: ['<|im_end|>'],
     loraTask: 'rewrite_grammar',
     buildPrompt: (selection) => ({
-      system: 'Condense the text to be shorter. Keep all key information. Do not use bullet points. Output only the shortened text.',
-      user: selection,
+      system: `Condense the text to be shorter. Keep all key information. Do not use bullet points.${ANTI_LEAKAGE}`,
+      user: wrapSelection(selection),
     }),
   },
 
@@ -222,7 +248,7 @@ export const AI_ACTIONS: Record<string, AIActionDef> = {
     group: 'refine',
     scope: 'selection',
     mode: 'replace',
-    maxTokens: 1024,
+    maxTokens: 512,
     temperature: 0.2,
     stop: ['<|im_end|>'],
     loraTask: 'rewrite_grammar',
@@ -233,12 +259,12 @@ export const AI_ACTIONS: Record<string, AIActionDef> = {
       { id: 'japanese', label: 'Japanese', context: 'Japanese' },
       { id: 'chinese', label: 'Chinese', context: 'Chinese' },
       { id: 'vietnamese', label: 'Vietnamese', context: 'Vietnamese' },
+      { id: 'korean', label: 'Korean', context: 'Korean' },
+      { id: 'arabic', label: 'Arabic', context: 'Arabic' },
+      { id: 'hindi', label: 'Hindi', context: 'Hindi' },
     ],
     buildPrompt: (selection, context) => {
       const lang = context || 'Spanish'
-      // Language-specific data: native name and native instruction.
-      // Including the target language in its own script primes the model to
-      // output in that script and reduces code-switching.
       const langData: Record<string, { native: string; instruction: string }> = {
         Spanish: { native: 'español', instruction: 'Traduzca el siguiente texto al español. No deje ninguna palabra ni título en inglés.' },
         French: { native: 'français', instruction: 'Traduisez le texte suivant en français. Ne laissez aucun mot ni titre en anglais.' },
@@ -246,11 +272,14 @@ export const AI_ACTIONS: Record<string, AIActionDef> = {
         Japanese: { native: '日本語', instruction: '以下のテキストを日本語に翻訳してください。英語の単語や見出しを残さないでください。' },
         Chinese: { native: '中文', instruction: '请将以下文本翻译成中文。所有英文单词和标题都必须翻译成中文，只有专有名词（如Apple、App Store、GDPR）可以保留英文。' },
         Vietnamese: { native: 'Tiếng Việt', instruction: 'Vui lòng dịch văn bản sau sang tiếng Việt. Không để lại bất kỳ từ hoặc tiêu đề tiếng Anh nào.' },
+        Korean: { native: '한국어', instruction: '다음 텍스트를 한국어로 번역하세요. 영어 단어나 제목을 남기지 마세요.' },
+        Arabic: { native: 'العربية', instruction: 'ترجم النص التالي إلى العربية. لا تترك أي كلمات أو عناوين بالإنجليزية.' },
+        Hindi: { native: 'हिन्दी', instruction: 'निम्नलिखित पाठ को हिंदी में अनुवाद करें। कोई भी अंग्रेजी शब्द या शीर्षक न छोड़ें।' },
       }
       const ld = langData[lang] || { native: lang, instruction: `Translate to ${lang}. Do not leave any English words or headings untranslated.` }
       return {
-        system: `You are a professional translator. Translate the following text into ${lang} (${ld.native}). ${ld.instruction}\nRules:\n1. Translate ALL text completely — do not leave any English words, phrases, or headings untranslated.\n2. Output ONLY the translated text, no explanations.\n3. Keep formatting (headings, lists, line breaks) intact.\n4. Translate markdown headings too — do not leave headings in English.\n5. Common English words (suspension, appeal, inactivity, violation, account, review, process, submit, documentation, evidence, verification, security, privacy, encryption) MUST be translated. Only proper nouns (Apple, KChat, App Store, GDPR) may stay in English.\n6. If a term has no direct translation, transliterate it and keep it consistent.`,
-        user: selection,
+        system: `You are a professional translator. Translate the following text into ${lang} (${ld.native}). ${ld.instruction}\nRules:\n1. Translate ALL text completely — do not leave any English words, phrases, or headings untranslated.\n2. Output ONLY the translated text, no explanations.\n3. Keep formatting (headings, lists, line breaks) intact.\n4. Translate markdown headings too — do not leave headings in English.\n5. Common English words MUST be translated. Only proper nouns (Apple, KChat, App Store, GDPR) may stay in English.\n6. If a term has no direct translation, transliterate it and keep it consistent.${ANTI_LEAKAGE}`,
+        user: wrapSelection(selection),
       }
     },
   },
@@ -271,8 +300,8 @@ export const AI_ACTIONS: Record<string, AIActionDef> = {
     loraTask: 'summarize_catchup',
     responsePrefix: '- ',
     buildPrompt: (selection) => ({
-      system: 'Summarize in 2-3 bullet points starting with "- ". Be concise. Output only the bullets.',
-      user: selection,
+      system: `Summarize in 2-3 bullet points starting with "- ". Be concise.${ANTI_LEAKAGE}`,
+      user: wrapSelection(selection),
     }),
   },
 
@@ -284,14 +313,14 @@ export const AI_ACTIONS: Record<string, AIActionDef> = {
     group: 'extract',
     scope: 'selection',
     mode: 'replace',
-    maxTokens: 200,
+    maxTokens: 250,
     temperature: 0.3,
     stop: ['<|im_end|>'],
     loraTask: 'extract_json',
     responsePrefix: '1. ',
     buildPrompt: (selection) => ({
-      system: 'Extract 3-5 key takeaways as a numbered list (1. 2. 3.). Be concise. Output only the list.',
-      user: selection,
+      system: `Extract 3-5 key takeaways as a numbered list (1. 2. 3.). Be concise.${ANTI_LEAKAGE}`,
+      user: wrapSelection(selection),
     }),
   },
 
@@ -303,15 +332,34 @@ export const AI_ACTIONS: Record<string, AIActionDef> = {
     group: 'extract',
     scope: 'selection',
     mode: 'replace',
-    maxTokens: 150,
+    maxTokens: 300,
     temperature: 0.3,
-    stop: ['<|im_end|>'],
+    stop: ['<|im_end|>', '}'],
     loraTask: 'extract_json',
-    responsePrefix: '- ',
     buildPrompt: (selection) => ({
-      system: 'Extract action items as a bullet list starting with "- ". Be concise. Output only the list.',
-      user: selection,
+      system: `Extract action items from the text as a JSON object with an "action_items" array of strings. Each string is one action item.${ANTI_LEAKAGE}`,
+      user: wrapSelection(selection),
     }),
+    // Post-process JSON output into bullet list
+    postProcess: (output: string) => {
+      try {
+        // Find JSON in output
+        const match = output.match(/\{[\s\S]*\}/)
+        if (match) {
+          const parsed = JSON.parse(match[0])
+          const items = parsed.action_items || parsed.items || parsed.actions || []
+          if (Array.isArray(items)) {
+            return items.map((item: string) => `- ${item}`).join('\n')
+          }
+        }
+      } catch {
+        // Fall through to bullet extraction
+      }
+      // Fallback: extract lines that look like action items
+      const lines = output.split('\n').filter((l) => l.trim().startsWith('-') || l.trim().match(/^\d+\./))
+      if (lines.length > 0) return lines.join('\n')
+      return output
+    },
   },
 
   generate_heading: {
@@ -322,13 +370,13 @@ export const AI_ACTIONS: Record<string, AIActionDef> = {
     group: 'extract',
     scope: 'selection',
     mode: 'replace',
-    maxTokens: 20,
+    maxTokens: 30,
     temperature: 0.3,
     stop: ['<|im_end|>', '\n'],
     loraTask: 'doc_creative',
     buildPrompt: (selection) => ({
-      system: 'Generate a single concise heading for the text. No quotes. Output only the heading.',
-      user: selection,
+      system: `Generate a single concise heading for the text. No quotes.${ANTI_LEAKAGE}`,
+      user: wrapSelection(selection),
     }),
   },
 
@@ -347,8 +395,8 @@ export const AI_ACTIONS: Record<string, AIActionDef> = {
     stop: ['<|im_end|>'],
     loraTask: 'doc_creative',
     buildPrompt: (_input, context) => ({
-      system: 'Continue the text naturally. Keep the same style. Write 2-3 sentences. Output only the continuation.',
-      user: context ?? '',
+      system: `Continue the text naturally. Keep the same style. Write 2-3 sentences.${ANTI_LEAKAGE}`,
+      user: wrapSelection(context ?? ''),
     }),
   },
 
@@ -367,7 +415,7 @@ export const AI_ACTIONS: Record<string, AIActionDef> = {
     responsePrefix: '- ',
     needsTopic: true,
     buildPrompt: (topic) => ({
-      system: 'Generate 5-7 creative ideas as bullet points (- ). Be specific and actionable. Output only the bullets.',
+      system: `Generate 5-7 creative ideas as bullet points (- ). Be specific and actionable.${ANTI_LEAKAGE}`,
       user: `Brainstorm ideas for: ${topic}`,
     }),
   },
@@ -391,7 +439,7 @@ export const AI_ACTIONS: Record<string, AIActionDef> = {
       system:
         'Generate a document outline as markdown headings (# for title, ## for sections, ### for subsections). ' +
         'Use bullet points (-) for details under each section. ' +
-        'Cover the given keywords. Output only the outline.',
+        `Cover the given keywords.${ANTI_LEAKAGE}`,
       user: `Create an outline for: ${topic}${keywordLine(keywords)}`,
     }),
   },
@@ -423,7 +471,7 @@ export const AI_ACTIONS: Record<string, AIActionDef> = {
           'Write a document section following the instruction. ' +
           'Cover the keywords naturally. ' +
           'If an outline is provided, fit coherently and do not duplicate other sections. ' +
-          'Write 2-4 paragraphs. Output only the content, no headings.',
+          `Write 2-4 paragraphs. Output only the content, no headings.${ANTI_LEAKAGE}`,
         user: `Instruction: ${topic}${keywordLine(keywords)}${outlineLine}`,
       }
     },
@@ -448,7 +496,7 @@ export const AI_ACTIONS: Record<string, AIActionDef> = {
       system:
         'Generate a complete document based on the brief. ' +
         'Use markdown headings (##) for sections and (-) for bullet lists. ' +
-        'Cover the keywords. Write clear, well-structured content. Output only the document.',
+        `Cover the keywords. Write clear, well-structured content.${ANTI_LEAKAGE}`,
       user: `Write a document about: ${topic}${keywordLine(keywords)}`,
     }),
   },
@@ -470,8 +518,8 @@ export const AI_ACTIONS: Record<string, AIActionDef> = {
     responsePrefix: '- ',
     needsFullDocument: true,
     buildPrompt: (_input, context) => ({
-      system: 'Summarize the document in 3-5 bullet points (- ). Capture the key points. Output only the bullets.',
-      user: `Summarize this document:\n\n${context ?? ''}`,
+      system: `Summarize the document in 3-5 bullet points (- ). Capture the key points.${ANTI_LEAKAGE}`,
+      user: `Summarize this document:\n\n${wrapDocument(context ?? '')}`,
     }),
   },
 
@@ -483,18 +531,23 @@ export const AI_ACTIONS: Record<string, AIActionDef> = {
     group: 'document',
     scope: 'document',
     mode: 'replace',
-    maxTokens: 1500,
+    maxTokens: 4096,
     temperature: 0.3,
     stop: ['<|im_end|>'],
-    loraTask: 'rewrite_grammar',
+    // No LoRA — the rewrite_grammar LoRA was trained on general prose and
+    // hallucinates when it encounters technical specification documents
+    // (schema field names like system_status, group_kind trigger it to
+    // generate fake schema content). The base model handles document
+    // improvement adequately without LoRA interference.
     needsFullDocument: true,
     buildPrompt: (_input, context) => ({
       system:
         'Improve the document for clarity, flow, and professionalism. Fix grammar and structure. Keep the meaning.\n' +
         'Markdown rules: blank line before/after headings, one heading per line, one paragraph per line.\n' +
         'Use # for title, ## for sections, - for bullets.\n' +
-        'Output only the improved document.',
-      user: `Improve this document:\n\n${context ?? ''}`,
+        'Preserve ALL sections, tables, and content. Do not skip or summarize any section.\n' +
+        `Output only the improved document.${ANTI_LEAKAGE}`,
+      user: `Improve this document:\n\n${wrapDocument(context ?? '')}`,
     }),
   },
 
@@ -506,18 +559,23 @@ export const AI_ACTIONS: Record<string, AIActionDef> = {
     group: 'document',
     scope: 'document',
     mode: 'replace',
-    maxTokens: 1500,
-    temperature: 0.2,
+    maxTokens: 4096,
+    temperature: 0.1,
     stop: ['<|im_end|>'],
-    loraTask: 'rewrite_grammar',
+    // No LoRA — the rewrite_grammar LoRA fights the "don't change wording"
+    // instruction by hallucinating new content. The base model handles
+    // formatting tasks adequately without LoRA interference.
     needsFullDocument: true,
     buildPrompt: (_input, context) => ({
       system:
         'Reformat the text into a well-structured markdown document.\n' +
         'Rules: # for title, ## for sections, ### for subsections. Blank line before/after headings. ' +
         'Use - for bullets, 1. 2. for numbered lists. One paragraph per line.\n' +
-        'Do NOT change wording or fix grammar. Preserve all information. Output only the formatted document.',
-      user: `Format this document:\n\n${context ?? ''}`,
+        'CRITICAL: Do NOT change any wording. Do NOT fix grammar. Do NOT add new content. ' +
+        'Do NOT remove content. Only fix markdown formatting and structure.\n' +
+        'Preserve ALL sections and information exactly as written.\n' +
+        `Output only the formatted document.${ANTI_LEAKAGE}`,
+      user: `Format this document:\n\n${wrapDocument(context ?? '')}`,
     }),
   },
 
@@ -536,8 +594,8 @@ export const AI_ACTIONS: Record<string, AIActionDef> = {
     needsFullDocument: true,
     useOutlineContext: true,
     buildPrompt: (_input, context) => ({
-      system: 'Generate a single concise, engaging title for the document. No quotes. Output only the title.',
-      user: `Document outline and section summaries:\n${context ?? ''}`,
+      system: 'Generate a single concise title for the document outlined below. No quotes. Output only the title.',
+      user: `Document outline:\n${context ?? ''}`,
     }),
   },
 
@@ -556,8 +614,8 @@ export const AI_ACTIONS: Record<string, AIActionDef> = {
     needsFullDocument: true,
     useOutlineContext: true,
     buildPrompt: (_input, context) => ({
-      system: 'Write an engaging introduction paragraph for the document. Hook the reader and preview the key topics based on the outline. Output only the introduction, no heading.',
-      user: `Document outline and section summaries:\n${context ?? ''}`,
+      system: 'Write an engaging introduction paragraph for the document outlined below. Hook the reader and preview the key topics. Output only the paragraph.',
+      user: `Document outline:\n${context ?? ''}`,
     }),
   },
 
@@ -576,8 +634,8 @@ export const AI_ACTIONS: Record<string, AIActionDef> = {
     needsFullDocument: true,
     useOutlineContext: true,
     buildPrompt: (_input, context) => ({
-      system: 'Write a conclusion paragraph that summarizes the key points and provides closure. Output only the conclusion, no heading.',
-      user: `Document outline and section summaries:\n${context ?? ''}`,
+      system: 'Write a conclusion paragraph for the document outlined below. Summarize the key points and provide closure. Output only the paragraph.',
+      user: `Document outline:\n${context ?? ''}`,
     }),
   },
 }
